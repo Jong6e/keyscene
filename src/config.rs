@@ -1,6 +1,6 @@
 //! Settings file: %APPDATA%\Keyscene\config.json
 
-use crate::preset::{default_presets, Preset, DEFAULT_HOTKEY};
+use crate::preset::{default_presets, Preset};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -50,7 +50,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             version: CURRENT_VERSION,
-            hotkeys: BTreeMap::from([(DEFAULT_HOTKEY.0.to_string(), DEFAULT_HOTKEY.1.to_string())]),
+            // The first-run shortcuts come without keys: the user picks combinations that suit them.
+            hotkeys: BTreeMap::new(),
             paused: false,
             presets: default_presets(),
             excluded_apps: Vec::new(),
@@ -238,7 +239,7 @@ mod tests {
         let path = temp_file("bad", "{ not json");
         let (cfg, warning) = load(&path);
         assert!(warning.is_some());
-        assert_eq!(cfg.hotkeys.get("preset:hidden-toggle").map(String::as_str), Some("Alt+Backquote"));
+        assert!(cfg.hotkeys.is_empty(), "defaults come without keys");
         let kept = fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(|e| e.ok())

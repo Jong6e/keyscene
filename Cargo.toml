@@ -1,6 +1,6 @@
 [package]
 name = "keyscene"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Keyscene - 단축키 하나로 Windows 동작 여러 개를 실행하고 되돌리는 트레이 도구"
 license = "MIT"

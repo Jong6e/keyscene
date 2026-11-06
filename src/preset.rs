@@ -250,6 +250,3 @@ pub fn default_presets() -> Vec<Preset> {
         },
     ]
 }
-
-/// The key the first-run "숨긴 항목 전환" shortcut starts with.
-pub const DEFAULT_HOTKEY: (&str, &str) = ("preset:hidden-toggle", "Alt+Backquote");
