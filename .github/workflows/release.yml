@@ -1,0 +1,49 @@
+# Builds the setup file on a clean Windows machine when a version tag (v1.2.3) is pushed,
+# and puts it in a draft release with its SHA-256. Publish the draft by hand after checking it.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches the app version
+        shell: pwsh
+        run: |
+          $version = (Get-Content tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match version $version in tauri.conf.json" }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build the setup file
+        shell: pwsh
+        run: |
+          npm install --global @tauri-apps/cli@2
+          tauri build
+
+      - name: Create a draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($setup.Name)" | Set-Content -Encoding ascii "$($setup.FullName).sha256"
+          $notes = "release-notes/${{ github.ref_name }}.md"
+          $body = if (Test-Path $notes) { Get-Content $notes -Raw } else { '' }
+          $lines = @($body.TrimEnd(), '', '---', "SHA-256 ($($setup.Name))", '```', $hash, '```')
+          ($lines -join "`n") | Set-Content -Encoding utf8 notes.md
+          gh release create "${{ github.ref_name }}" $setup.FullName "$($setup.FullName).sha256" --draft --title "Keyscene ${{ github.ref_name }}" --notes-file notes.md

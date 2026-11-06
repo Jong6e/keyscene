@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keyscene</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <button type="button" id="settings-back" class="icon-button" aria-label="뒤로" title="뒤로 (Esc)" hidden></button>
+  <h1 id="view-title">단축키</h1>
+  <button type="button" id="preset-new" class="icon-button" aria-label="새 단축키" title="새 단축키"></button>
+  <button type="button" id="open-settings" class="icon-button" aria-label="설정" title="설정"></button>
+</header>
+<main>
+  <div id="notice" class="notice" role="status" hidden>
+    <span id="notice-text"></span>
+    <button id="notice-close" class="link">닫기</button>
+  </div>
+
+  <section id="view-list" class="view" aria-labelledby="view-title">
+    <p id="presets-error" class="help standalone" role="alert" hidden></p>
+    <div id="preset-list" class="preset-list"></div>
+    <p class="foot">창을 닫아도 트레이에서 계속 실행됩니다.</p>
+  </section>
+
+  <section id="view-settings" class="view" aria-labelledby="view-title" hidden>
+    <h2>일반</h2>
+    <section class="card">
+      <div class="row">
+        <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5v7"/><path d="M6 4.8a6.5 6.5 0 1 0 8 0"/></svg>
+        <span class="label"><span>Windows 시작 시 자동 실행</span></span>
+        <button id="autostart" class="switch" role="switch" aria-checked="false" aria-label="Windows 시작 시 자동 실행"><span></span></button>
+      </div>
+      <div class="divider"></div>
+      <div class="row">
+        <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M8 7v6M12 7v6"/></svg>
+        <span class="label"><span>단축키 일시 중지</span></span>
+        <button id="paused" class="switch" role="switch" aria-checked="false" aria-label="단축키 일시 중지"><span></span></button>
+      </div>
+    </section>
+
+    <section class="card" id="excluded-card">
+      <div class="row">
+        <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="11" rx="1.5"/><path d="M7 17.5h6"/><circle cx="10" cy="9" r="3"/><path d="M7.9 11.1l4.2-4.2"/></svg>
+        <div class="label">
+          <span id="excluded-title">단축키를 쓰지 않을 앱</span>
+          <span class="sub">이 앱이 앞에 있으면 단축키를 쉽니다.</span>
+        </div>
+        <button type="button" id="excluded-add" class="button" data-key="excluded-add"><span class="i" aria-hidden="true"><svg viewBox="0 0 12 12"><path d="M6 1v10M1 6h10"/></svg></span>앱 추가</button>
+      </div>
+      <p id="excluded-status" class="status-line" role="status" hidden></p>
+      <p class="help" data-help="excluded" role="alert" hidden></p>
+      <ul id="excluded-list" class="excluded-list" aria-labelledby="excluded-title"></ul>
+    </section>
+
+    <h2>정보</h2>
+    <section class="card">
+      <div class="row">
+        <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 9v5"/><circle cx="10" cy="6.3" r="0.4"/></svg>
+        <span class="label"><span id="app-version">Keyscene</span></span>
+        <button type="button" id="update-check" class="button">새 버전 확인</button>
+      </div>
+      <!-- Always in the page (only emptied), so screen readers announce each new result. -->
+      <p id="update-text" class="update-text" role="status"></p>
+      <div id="update-actions" class="update-actions" hidden>
+        <button type="button" id="update-open" class="button primary">다운로드 페이지 열기</button>
+      </div>
+    </section>
+  </section>
+</main>
+<script src="components.js"></script>
+<script src="app.js"></script>
+<script src="presets.js"></script>
+<script src="excluded.js"></script>
+</body>
+</html>

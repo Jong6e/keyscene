@@ -1,0 +1,64 @@
+[package]
+name = "keyscene"
+version = "0.3.0"
+edition = "2021"
+description = "Keyscene - 단축키 하나로 Windows 동작 여러 개를 실행하고 되돌리는 트레이 도구"
+license = "MIT"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# PNG encoding for the settings window's icons (Tauri already uses this version).
+png = "0.18"
+# COM-based Windows APIs (audio, Explorer selection). Same version Tauri already uses.
+windows = { version = "0.62", features = [
+    "ApplicationModel_DataTransfer",
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Power",
+    "Win32_System_Shutdown",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Registry",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Web_InternetExplorer",
+    "Win32_UI_HiDpi",
+] }
+windows-core = "0.62"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
