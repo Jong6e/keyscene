@@ -16,13 +16,15 @@ let pendingData = null;  // data that arrived during a drag
 
 const CATALOG = [
   { cat: "앱 · 파일 · 웹", items: [
-    { key: "open_app", label: "앱 열기…", form: "app", make: () => ({ kind: "open_app", app: null, if_running: "front", monitor: { kind: "app_default" }, window: "app_default", on_restore: "keep" }) },
+    { key: "open_app", label: "앱 열기…", form: "app", make: () => ({ kind: "open_app", app: null, when: "always", if_running: "front", monitor: { kind: "primary" }, window: "maximized", on_restore: "minimize" }) },
     { key: "open_path", label: "파일·폴더 열기…", form: "path", make: () => ({ kind: "open_path", path: "" }) },
     { key: "open_url", label: "웹사이트 열기…", form: "url", make: () => ({ kind: "open_url", url: "", browser: { browser: "default", profile_dir: "", profile_name: "" }, new_window: false, private: false }) },
     { key: "app_windows", label: "앱 최소화·닫기…", form: "app_windows", make: () => ({ kind: "app_windows", app: null, op: "minimize" }) },
   ] },
   { cat: "창", items: [
     { key: "show_desktop", label: "바탕 화면 보기", make: () => ({ kind: "show_desktop" }) },
+    { key: "window_sets", label: "창 세트 전환…", desc: "지금 열린 앱을 세트로 기록 · 누를 때마다 다음 세트", form: "window_sets",
+      make: () => ({ kind: "window_sets", sets: [], when: "always", others: "keep", mute_hidden: false, pause_hidden: false }) },
     { key: "active_window:minimize", label: "현재 창 최소화", make: () => ({ kind: "active_window", op: "minimize" }) },
     { key: "active_window:maximize", label: "현재 창 최대화", make: () => ({ kind: "active_window", op: "maximize" }) },
     { key: "active_window:topmost", label: "현재 창 맨 위 고정", make: () => ({ kind: "active_window", op: "topmost" }) },
@@ -71,8 +73,15 @@ const NEW_NAME = "새 단축키"; // name of a card that has none
 
 /// Same rule as Step::restorable in src/preset.rs. The "전환" (toggle: true) forms of the five
 /// on/off steps are restorable too; folder_tree and selection_hidden are not.
+/// Same rule as Preset::cycles: two or more window sets make every press run the steps again.
+function cycles(p) {
+  return p.steps.some((s) => s.kind === "window_sets" && (s.sets?.length ?? 0) >= 2);
+}
+
 function isRestorable(step) {
   if (step.kind === "app_windows") return step.op === "minimize";
+  // One set: pressing again puts the windows back. Two or more: each press shows the next set.
+  if (step.kind === "window_sets") return (step.sets?.length ?? 0) === 1;
   if (step.kind === "open_app") return (step.on_restore ?? "keep") !== "keep";
   return ["show_desktop", "active_window", "speaker_mute", "speaker_volume", "mic_mute",
     "desktop_icons", "hidden_items", "theme"].includes(step.kind);
@@ -80,6 +89,10 @@ function isRestorable(step) {
 
 // Fixed texts for the option values (also used by the forms).
 const IF_RUNNING = [{ value: "front", label: "맨 앞으로 가져오기" }, { value: "new", label: "하나 더 열기" }];
+// Whether a step that names an app runs while that app is not running (AppWhen in src/preset.rs).
+const APP_WHEN = [{ value: "always", label: "항상 (꺼져 있으면 열기)" }, { value: "if_running", label: "앱이 실행 중일 때만" }];
+const OTHERS = [{ value: "keep", label: "그대로 둠" }, { value: "minimize", label: "최소화" }];
+const MAX_SETS = 6;
 const WINDOW_STATES = [
   { value: "app_default", label: "앱 기본" }, { value: "maximized", label: "최대화" }, { value: "minimized", label: "최소화" },
   { value: "left_half", label: "왼쪽 절반" }, { value: "right_half", label: "오른쪽 절반" },
@@ -118,6 +131,11 @@ function stepTitle(s) {
     case "open_url": return `웹사이트 열기 · ${urlHost(s.url)}`;
     case "app_windows": return `${s.app?.name ?? "앱"} ${s.op === "close" ? "닫기" : "최소화"}`;
     case "show_desktop": return "바탕 화면 보기";
+    case "window_sets": {
+      const sets = s.sets ?? [];
+      if (sets.length === 1) return `창 세트 · ${setName(sets[0], 0)}`;
+      return sets.length ? `창 세트 전환 · ${sets.map(setName).join(" ↔ ")}` : "창 세트 전환 · 세트 없음";
+    }
     case "active_window": return { minimize: "현재 창 최소화", maximize: "현재 창 최대화", topmost: "현재 창 맨 위 고정" }[s.op];
     case "speaker_mute": return s.toggle ? "스피커 음소거 전환" : s.mute ? "스피커 음소거" : "스피커 음소거 해제";
     case "speaker_volume": return `음량 ${s.percent}%로 맞추기`;
@@ -144,8 +162,8 @@ function stepTitle(s) {
 function stepSub(s) {
   switch (s.kind) {
     case "open_app": {
-      const parts = [monitorText(s.monitor), s.window !== "app_default" ? label(WINDOW_STATES, s.window) : null,
-        s.if_running === "new" ? "하나 더 열기" : null].filter(Boolean);
+      const parts = [s.when === "if_running" ? "실행 중일 때만" : null, monitorText(s.monitor),
+        s.window !== "app_default" ? label(WINDOW_STATES, s.window) : null, s.if_running === "new" ? "하나 더 열기" : null].filter(Boolean);
       return parts.length ? parts.join(" · ") : null;
     }
     case "open_path": return s.path || null;
@@ -153,9 +171,40 @@ function stepSub(s) {
     case "open_url": return [(s.browser?.browser ?? "default") === "default" ? null : browserText(s.browser), s.new_window ? "새 창" : null,
       s.private ? (s.browser?.browser === "edge" ? "InPrivate" : "시크릿") : null].filter(Boolean).join(" · ");
     case "show_desktop": return "모든 창 내리기";
+    case "window_sets": {
+      const sets = s.sets ?? [];
+      const parts = [sets.length === 1 ? appsText(sets[0]) : sets.length > 1 ? "누를 때마다 다음 세트" : null,
+        s.when === "if_running" ? "실행 중인 앱만" : null, s.others === "minimize" ? "다른 창 최소화" : null,
+        s.mute_hidden ? "내린 앱 소리 끔" : null, s.pause_hidden ? "미디어 일시 정지" : null].filter(Boolean);
+      return parts.length ? parts.join(" · ") : null;
+    }
     case "app_windows": return s.op === "close" ? CLOSE_NOTE : null;
     default: return null;
   }
+}
+
+/// "youtube.com · Chrome" under a browser window of a set.
+function siteSub(w) {
+  const host = urlHost(w.url);
+  return w.browser?.browser && w.browser.browser !== "default" ? `${host} · ${browserText(w.browser)}` : host;
+}
+
+/// What the user typed -> a full http(s) address, or null. "youtube.com" gets "https://".
+function webAddress(text) {
+  let v = text.trim();
+  if (v && !/^[a-z][a-z0-9+.-]*:/i.test(v)) v = `https://${v}`;
+  try { const u = new URL(v); return (u.protocol === "http:" || u.protocol === "https:") && u.host.includes(".") ? v : null; } catch { return null; }
+}
+
+function setName(set, i) {
+  return (set?.name ?? "").trim() || `세트 ${i + 1}`;
+}
+
+/// "Code, YouTube 외 2개" for a set's apps and browser windows.
+function appsText(set) {
+  const names = [...(set?.apps ?? []).map((a) => a.name), ...(set?.sites ?? []).map((w) => w.title || urlHost(w.url))];
+  if (!names.length) return "비어 있음";
+  return names.length > 2 ? `${names.slice(0, 2).join(", ")} 외 ${names.length - 2}개` : names.join(", ");
 }
 
 /// Short form for the collapsed card summary.
@@ -415,7 +464,7 @@ function renderCard(p) {
     h("button", { type: "button", class: "add-step", "data-key": `add:${p.id}`, onclick: () => openPicker(p.id) },
       icon("plus"), "동작 추가"),
     // Only worth offering when something would be undone.
-    p.steps.some(isRestorable) ? revertRow(p) : null);
+    !cycles(p) && p.steps.some(isRestorable) ? revertRow(p) : null);
 
   const error = cardErrors[p.id] ?? p.last_error;
   // Busy here (a click) or in the backend (the shortcut): no second run, no delete until it ends.
@@ -480,7 +529,7 @@ function revertRow(p) {
 
 /// Picture for steps that do not point at an app or file (ICONS names in components.js).
 const KIND_GLYPH = {
-  open_url: "globe", show_desktop: "desktop", active_window: "window", speaker_mute: "speaker",
+  open_url: "globe", show_desktop: "desktop", active_window: "window", window_sets: "sets", speaker_mute: "speaker",
   speaker_volume: "speaker", mic_mute: "mic", media: "media", desktop_icons: "grid", hidden_items: "eye",
   theme: "theme", monitor_off: "monitorOff", lock: "lock", sleep: "moon", clear_clipboard: "clipboard",
   screenshot: "capture", send_keys: "keyboard", type_text: "text", wait: "clock", selection_hidden: "selection",
@@ -525,7 +574,7 @@ function renderStep(p, s, i) {
     h("button", { type: "button", class: "step-body", "data-key": `edit:${p.id}:${i}`,
       "aria-label": hasForm ? `${title} 편집` : `${title}, 다른 동작으로 바꾸기`,
       onclick: () => (hasForm ? openStepForm(p.id, i) : openPicker(p.id, i)) }, text),
-    isRestorable(s) ? h("span", { class: "restore-mark", role: "img", "aria-label": RESTORE_LABEL, title: RESTORE_TIP, html: ICONS.restore }) : null,
+    !cycles(p) && isRestorable(s) ? h("span", { class: "restore-mark", role: "img", "aria-label": RESTORE_LABEL, title: RESTORE_TIP, html: ICONS.restore }) : null,
     h("button", { type: "button", class: "icon-button small", "data-key": `remove:${p.id}:${i}`, "aria-label": `${title} 제거`, title: "제거",
       // Ignore the 2nd click of a double-click: the next row has moved under the pointer.
       onclick: (e) => { if (e.detail <= 1) removeStep(p.id, i); } }, icon("close")));
@@ -855,12 +904,15 @@ const FORMS = {
       recording = true;
       paint();
       window.addEventListener("keydown", onKey, true);
+      // Keyscene's own shortcuts are off while recording; going to another app must not leave them off.
+      window.addEventListener("blur", stop);
       try { await invoke("begin_hotkey_capture"); } catch {}
     }
     async function stop() {
       if (!recording) return;
       recording = false;
       window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("blur", stop);
       paint();
       try { render(await invoke("end_hotkey_capture")); } catch {}
     }
@@ -959,6 +1011,7 @@ const FORMS = {
 
   app(step) {
     const chooser = appChooser(step.app);
+    const when = comboField(APP_WHEN, step.when ?? "always", () => {});
     const ifRunning = comboField(IF_RUNNING, step.if_running ?? "front", () => {});
     const monitorOpts = [
       { value: "app_default", label: "앱 기본 위치" }, { value: "primary", label: "주 모니터" }, { value: "cursor", label: "마우스가 있는 모니터" },
@@ -989,6 +1042,7 @@ const FORMS = {
     return {
       body: h("div", {}, chooser.el,
         h("div", { class: "options card" },
+          optionRow("실행 조건", when.el),
           optionRow("이미 실행 중이면", ifRunning.el),
           optionRow("모니터", monitor.el),
           optionRow("창 상태", windowState.el),
@@ -1000,7 +1054,7 @@ const FORMS = {
         if (app.error) return app;
         const mv = monitor.combo.value;
         const mon = mv.startsWith("m:") ? { kind: "specific", id: mv.slice(2), name: monitorNames[mv.slice(2)] ?? "" } : { kind: mv };
-        return { step: { ...step, app: app.app, if_running: ifRunning.combo.value, monitor: mon, window: windowState.combo.value, on_restore: onRestore.combo.value } };
+        return { step: { ...step, app: app.app, when: when.combo.value, if_running: ifRunning.combo.value, monitor: mon, window: windowState.combo.value, on_restore: onRestore.combo.value } };
       },
     };
   },
@@ -1020,6 +1074,135 @@ const FORMS = {
         return { step: { ...step, app: app.app, op: seg.value() } };
       },
     };
+  },
+
+  window_sets(step) {
+    // Working copy: [{ name, apps: [AppRef], sites: [SetSite] }]. Recorded from the windows open right now.
+    const sets = structuredClone(step.sets ?? []).map((x) => ({ ...x, apps: x.apps ?? [], sites: x.sites ?? [] }));
+    const listEl = h("div", { class: "sets" });
+    const status = h("p", { class: "note", role: "status" });
+    const note = h("p", { class: "note" });
+    const addBtn = h("button", { type: "button", class: "button", "data-key": "set-add", onclick: () => record(null) },
+      icon("plus"), "지금 열린 창을 새 세트로 기록");
+    const when = comboField(APP_WHEN, step.when ?? "always", () => {});
+    const others = comboField(OTHERS, step.others ?? "keep", () => {});
+    const mute = h("input", { type: "checkbox", checked: !!step.mute_hidden });
+    const pause = h("input", { type: "checkbox", checked: !!step.pause_hidden });
+    const checks = h("div", { class: "checks" },
+      h("label", {}, mute, h("span", {}, "최소화되는 세트의 앱 소리 끄기")),
+      h("label", {}, pause, h("span", {}, "최소화되는 세트의 앱 미디어 일시 정지 (라이브는 계속 재생)")));
+    const siteDrafts = {}; // set index -> address typed in its "웹사이트 추가" box
+    let api = null;
+
+    /// Fills set `i` (null = a new set) with the apps and browser windows open now.
+    async function record(i) {
+      status.textContent = "열린 창을 읽는 중…";
+      let found = [];
+      try {
+        found = (await invoke("list_open_window_apps")).slice(0, 30);
+      } catch (err) {
+        status.textContent = `열린 창을 읽지 못했습니다. ${err}`;
+        return;
+      }
+      if (!found.length) {
+        status.textContent = "기록할 창이 없습니다. 세트에 넣을 앱을 먼저 여세요.";
+        return;
+      }
+      const apps = found.filter((x) => x.app).map((x) => x.app);
+      const sites = found.filter((x) => x.site).map((x) => x.site);
+      status.textContent = sites.length ? `앱 ${apps.length}개, 브라우저 창 ${sites.length}개를 기록했습니다.` : `앱 ${apps.length}개를 기록했습니다.`;
+      if (i == null) sets.push({ name: `세트 ${sets.length + 1}`, apps, sites });
+      else {
+        // Websites typed in by hand stay; only the recorded windows are replaced.
+        const typed = sets[i].sites.filter((w) => !w.title && !sites.some((x) => x.url === w.url));
+        Object.assign(sets[i], { apps, sites: [...sites, ...typed] });
+      }
+      draw(i == null ? `set-name:${sets.length - 1}` : `set-record:${i}`);
+    }
+
+    /// Adds the address typed in set `i`'s box as a browser window of that set.
+    function addSite(i) {
+      const url = webAddress(siteDrafts[i] ?? "");
+      if (!url) {
+        status.textContent = "http:// 또는 https://로 시작하는 웹 주소를 입력하세요.";
+        listEl.querySelector(`[data-key="set-url:${i}"]`)?.focus();
+        return;
+      }
+      sets[i].sites.push({ url, browser: { browser: "default", profile_dir: "", profile_name: "" }, title: "" });
+      delete siteDrafts[i];
+      status.textContent = "";
+      draw(`set-url:${i}`);
+    }
+
+    function row(iconEl, title, sub, removeKey, removeLabel, remove) {
+      return h("li", { class: "set-app" }, iconEl,
+        h("span", { class: "set-app-text" }, h("span", { class: "app-name", title }, title), sub ? h("span", { class: "sub", title: sub }, sub) : null),
+        h("button", { type: "button", class: "icon-button small", "data-key": removeKey, "aria-label": `${removeLabel} 빼기`, title: "세트에서 빼기",
+          onclick: (e) => { if (e.detail <= 1) remove(); } }, icon("close")));
+    }
+
+    function draw(focusKey) {
+      const key = focusKey ?? document.activeElement?.dataset?.key;
+      listEl.replaceChildren(...sets.map((set, i) => {
+        const nameInput = h("input", { type: "text", value: set.name, maxlength: "30", "data-key": `set-name:${i}`,
+          "aria-label": `${i + 1}번째 세트 이름`, placeholder: `세트 ${i + 1}`, oninput: (e) => { set.name = e.target.value; } });
+        const urlInput = h("input", { type: "url", value: siteDrafts[i] ?? "", placeholder: "웹사이트 주소 (예: youtube.com)", spellcheck: "false",
+          "data-key": `set-url:${i}`, "aria-label": `${setName(set, i)}에 넣을 웹사이트 주소`,
+          oninput: (e) => { siteDrafts[i] = e.target.value; },
+          // Enter adds the site instead of saving the whole form.
+          onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); addSite(i); } } });
+        const items = [
+          ...set.apps.map((a, n) => row(fileIcon(`${a.source === "file" ? "path" : "app"}:${a.id}`, 20, () => tile(a.name || "?")),
+            a.name, null, `set-app:${i}:${n}`, a.name,
+            () => { set.apps.splice(n, 1); draw(`set-add-site:${i}`); })),
+          ...set.sites.map((w, n) => row(glyph("globe"), w.title || urlHost(w.url), siteSub(w), `set-site:${i}:${n}`, w.title || urlHost(w.url),
+            () => { set.sites.splice(n, 1); draw(`set-add-site:${i}`); })),
+        ];
+        return h("section", { class: "set card", "aria-label": setName(set, i) },
+          h("div", { class: "set-head" },
+            nameInput,
+            h("button", { type: "button", class: "button subtle", "data-key": `set-record:${i}`, onclick: () => record(i) }, "다시 기록"),
+            h("button", { type: "button", class: "icon-button small", "data-key": `set-remove:${i}`, "aria-label": `${setName(set, i)} 삭제`, title: "세트 삭제",
+              onclick: (e) => { if (e.detail <= 1) { sets.splice(i, 1); draw("set-add"); } } }, icon("close"))),
+          items.length ? h("ul", { class: "set-apps" }, items) : h("p", { class: "sub set-empty" }, "비어 있음 · ‘다시 기록’을 누르거나 웹사이트를 넣으세요"),
+          h("div", { class: "input-row set-url" }, urlInput,
+            h("button", { type: "button", class: "button", "data-key": `set-add-site:${i}`, onclick: () => addSite(i) }, "웹사이트 추가")));
+      }));
+      addBtn.disabled = sets.length >= MAX_SETS;
+      // Sound and media only change for other sets' windows, so they need two sets or more.
+      checks.hidden = sets.length < 2;
+      note.textContent = sets.length >= 2
+        ? `누를 때마다 다음 세트의 창을 띄우고, 다른 세트의 앱은 최소화합니다. 다시 눌러도 원래대로 돌아가지 않고, 같은 단축키의 다른 동작도 누를 때마다 다시 실행됩니다(예: 스피커를 세트마다 번갈아 끄고 켜려면 스피커 동작을 ‘전환’으로).${sets.length >= MAX_SETS ? ` 세트는 ${MAX_SETS}개까지.` : ""}`
+        : "세트가 하나면 누를 때 그 창들을 띄우고, 다시 누르면 원래대로. 세트를 둘 이상 기록하면 번갈아 띄웁니다.";
+      const again = key && (listEl.querySelector(`[data-key="${CSS.escape(key)}"]`) ?? (key === "set-add" ? addBtn : null));
+      again?.focus();
+      api?.onChange?.();
+    }
+    draw();
+
+    api = {
+      body: h("div", {},
+        listEl,
+        h("div", { class: "button-row" }, addBtn),
+        status,
+        h("div", { class: "options card" },
+          optionRow("실행 조건", when.el),
+          optionRow("세트에 없는 창", others.el)),
+        checks,
+        note,
+        h("p", { class: "note" }, "화면에 떠 있는 창만 기록합니다(최소화한 창, Keyscene 창, 파일 탐색기는 빼고). Chrome·Edge는 창마다 그때 보던 웹사이트로 기록합니다. 소리는 앱 단위로만 꺼져서 그 앱의 창이 하나라도 떠 있으면 끄지 않습니다(일시 정지는 창마다 됩니다).")),
+      ready: () => sets.length > 0,
+      read: () => {
+        if (!sets.length) return { error: "지금 열린 창을 세트로 기록하세요.", focus: addBtn };
+        const empty = sets.findIndex((x) => !x.apps.length && !x.sites.length);
+        if (empty >= 0) return { error: `‘${setName(sets[empty], empty)}’이(가) 비어 있습니다. 다시 기록하거나 세트를 삭제하세요.`,
+          focus: listEl.querySelector(`[data-key="set-record:${empty}"]`) };
+        const clean = sets.map((x, i) => ({ name: setName(x, i), apps: x.apps, sites: x.sites }));
+        return { step: { ...step, sets: clean, when: when.combo.value, others: others.combo.value,
+          mute_hidden: mute.checked, pause_hidden: pause.checked } };
+      },
+    };
+    return api;
   },
 
   folder_tree(step) {

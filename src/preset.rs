@@ -23,6 +23,9 @@ pub enum Step {
     // --- apps, files, web ---
     OpenApp {
         app: AppRef,
+        /// Only act when the app is already running, or open it when it is not.
+        #[serde(default)]
+        when: AppWhen,
         #[serde(default)]
         if_running: IfRunning,
         #[serde(default)]
@@ -50,6 +53,24 @@ pub enum Step {
     ShowDesktop,
     /// Acts on the window that was in front when the preset started.
     ActiveWindow { op: ActiveWindowOp },
+    /// Sets of apps recorded from the windows that were open. One set: brings its windows up and
+    /// pressing again puts them back. Two or more: each press brings up the next set and minimizes
+    /// the apps of the other sets.
+    WindowSets {
+        sets: Vec<WindowSet>,
+        /// Always: open the set's apps that are not running. IfRunning: only bring up running ones.
+        #[serde(default)]
+        when: AppWhen,
+        /// What happens to windows of apps that are in no set.
+        #[serde(default)]
+        others: OthersOp,
+        /// Turn off the sound of the apps a switch minimizes; showing their set turns it back on.
+        #[serde(default)]
+        mute_hidden: bool,
+        /// Pause the media playing in the apps a switch minimizes; showing their set plays it again.
+        #[serde(default)]
+        pause_hidden: bool,
+    },
 
     // --- sound, media ---
     /// `toggle`: flip the current state instead of setting `mute` (the same for the others below).
@@ -111,6 +132,49 @@ pub struct AppRef {
 pub enum AppSource {
     Installed,
     File,
+}
+
+/// Whether a step that names an app runs when that app is not running.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppWhen {
+    /// Run in any case; an app that is not running is opened.
+    #[default]
+    Always,
+    /// Only while the app is running; otherwise the step does nothing.
+    IfRunning,
+}
+
+/// A named group of apps, recorded from the windows open at the time.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WindowSet {
+    #[serde(default)]
+    pub name: String,
+    pub apps: Vec<AppRef>,
+    /// Browser windows, each known by the page it shows. Kept apart from `apps` so one browser
+    /// can have a window in each set.
+    #[serde(default)]
+    pub sites: Vec<SetSite>,
+}
+
+/// A browser window in a set: the page it showed when recorded (or that the user typed in).
+/// Showing the set finds the window that still shows that site, or opens it in a new window.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SetSite {
+    pub url: String,
+    #[serde(default)]
+    pub browser: BrowserRef,
+    /// The window title when recorded, for display.
+    #[serde(default)]
+    pub title: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OthersOp {
+    #[default]
+    Keep,
+    Minimize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,9 +268,21 @@ pub enum MediaKey {
     Previous,
 }
 
+impl Preset {
+    /// True when the shortcut cycles window sets (two or more): every press runs the steps again
+    /// and moves on to the next set, so it never keeps anything to put back.
+    pub fn cycles(&self) -> bool {
+        self.steps.iter().any(|s| matches!(s, Step::WindowSets { sets, .. } if sets.len() >= 2))
+    }
+}
+
 impl Step {
     /// True when restoring can undo this step.
     pub fn restorable(&self) -> bool {
+        // Two or more sets: each press moves on to the next set instead of putting things back.
+        if let Step::WindowSets { sets, .. } = self {
+            return sets.len() == 1;
+        }
         matches!(
             self,
             Step::OpenApp { on_restore: OnRestore::Minimize | OnRestore::Close, .. }

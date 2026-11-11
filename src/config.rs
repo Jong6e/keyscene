@@ -213,6 +213,7 @@ mod tests {
                 Step::ShowDesktop,
                 Step::OpenApp {
                     app: AppRef { source: AppSource::Installed, id: "Claude_pzs8sxrjxfjjc!Claude".into(), name: "Claude".into(), args: String::new() },
+                    when: AppWhen::IfRunning,
                     if_running: IfRunning::Front,
                     monitor: MonitorRef::Specific { id: r"\?\DISPLAY#X".into(), name: "DELL U2723QE".into() },
                     window: WindowState::Maximized,
@@ -221,6 +222,24 @@ mod tests {
                 Step::OpenUrl { url: "https://example.com".into(), browser: BrowserRef { browser: "chrome".into(), profile_dir: "Profile 1".into(), profile_name: "개인".into() }, new_window: true, private: false },
                 Step::SendKeys { spec: "Super+Control+ArrowRight".into() },
                 Step::Wait { ms: 500 },
+                Step::WindowSets {
+                    sets: vec![
+                        WindowSet {
+                            name: "업무".into(),
+                            apps: vec![AppRef { source: AppSource::File, id: r"C:\Program Files\Code\Code.exe".into(), name: "Visual Studio Code".into(), args: String::new() }],
+                            sites: vec![],
+                        },
+                        WindowSet {
+                            name: "쉬는 시간".into(),
+                            apps: vec![],
+                            sites: vec![SetSite { url: "https://www.youtube.com/".into(), browser: BrowserRef { browser: "chrome".into(), ..Default::default() }, title: "YouTube".into() }],
+                        },
+                    ],
+                    when: AppWhen::IfRunning,
+                    others: OthersOp::Minimize,
+                    mute_hidden: true,
+                    pause_hidden: true,
+                },
             ],
             revert_after_min: Some(10),
         });
@@ -232,6 +251,35 @@ mod tests {
         assert_eq!(back.presets[last].revert_after_min, Some(10));
         let json = fs::read_to_string(&path).unwrap();
         assert!(json.contains(r#""kind": "open_app""#) && json.contains(r#""kind": "specific""#));
+        assert!(json.contains(r#""when": "if_running""#) && json.contains(r#""kind": "window_sets""#));
+    }
+
+    #[test]
+    fn steps_saved_before_app_conditions_still_load() {
+        use crate::preset::*;
+        // 0.3.1 files: open_app had no "when"; it always opened the app.
+        let old = r#"{"kind":"open_app","app":{"source":"file","id":"C:\\a.exe","name":"a"}}"#;
+        match serde_json::from_str::<Step>(old).unwrap() {
+            Step::OpenApp { when, .. } => assert_eq!(when, AppWhen::Always),
+            other => panic!("{other:?}"),
+        }
+        let sets = r#"{"kind":"window_sets","sets":[{"apps":[]}]}"#;
+        match serde_json::from_str::<Step>(sets).unwrap() {
+            Step::WindowSets { sets, when, others, mute_hidden, pause_hidden } => {
+                assert_eq!((sets.len(), when, others, mute_hidden, pause_hidden), (1, AppWhen::Always, OthersOp::Keep, false, false));
+                assert!(sets[0].sites.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_sets_restore_only_with_one_set() {
+        use crate::preset::*;
+        let set = WindowSet { name: String::new(), apps: vec![], sites: vec![] };
+        let step = |n: usize| Step::WindowSets { sets: vec![set.clone(); n], when: AppWhen::Always, others: OthersOp::Keep, mute_hidden: false, pause_hidden: false };
+        assert!(step(1).restorable(), "one set: pressing again puts the windows back");
+        assert!(!step(2).restorable(), "two sets: pressing again shows the next set");
     }
 
     #[test]

@@ -58,6 +58,8 @@ const ICONS = {
   text: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4.5h12M10 4.5v11M7.5 15.5h5"/></svg>',
   clock: '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 6v4l2.5 2"/></svg>',
   // A dashed selection with an eye: "the selected items' hidden attribute".
+  // Two stacked windows: "창 세트".
+  sets: '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="6.5" width="11" height="9" rx="1.5"/><path d="M6.5 6.5V5a1.5 1.5 0 0 1 1.5-1.5h8A1.5 1.5 0 0 1 17.5 5v6a1.5 1.5 0 0 1-1.5 1.5h-2.5"/></svg>',
   selection: '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="1.5" stroke-dasharray="2.2 1.8"/><path d="M5.5 10s1.8-3 4.5-3 4.5 3 4.5 3-1.8 3-4.5 3-4.5-3-4.5-3z"/><circle cx="10" cy="10" r="1.2"/></svg>',
 };
 const icon = (name, cls = "i") => h("span", { class: cls, html: ICONS[name] });
@@ -542,12 +544,18 @@ const KEY_NAMES = {
   BracketRight: "]", Backslash: "\\", Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/",
   ArrowRight: "→", ArrowLeft: "←", ArrowUp: "↑", ArrowDown: "↓", Escape: "Esc", Enter: "Enter",
   Space: "Space", Backspace: "Backspace", Delete: "Delete", Tab: "Tab", PrintScreen: "PrtSc",
+  Lang1: "한/영", Lang2: "한자", ContextMenu: "메뉴", NumpadEnter: "Num Enter", NumpadDecimal: "Num .",
+  AudioVolumeUp: "음량 크게", AudioVolumeDown: "음량 작게", AudioVolumeMute: "음소거",
+  MediaPlayPause: "재생/일시 중지", MediaTrackNext: "다음 곡", MediaTrackPrevious: "이전 곡", MediaStop: "정지",
 };
+// These two would read as "Num + +" with the joining plus signs, so they are spelled out.
+const NUMPAD_OPS = { NumpadAdd: "Num 더하기", NumpadSubtract: "Num 빼기", NumpadMultiply: "Num 곱하기", NumpadDivide: "Num 나누기" };
 
 /// "Super+Control+ArrowRight" -> "Win + Ctrl + →"
 function specLabel(spec) {
   return spec.split("+").map((p) => {
     if (KEY_NAMES[p]) return KEY_NAMES[p];
+    if (NUMPAD_OPS[p]) return NUMPAD_OPS[p];
     if (/^Key[A-Z]$/.test(p)) return p.slice(3);
     if (/^Digit\d$/.test(p)) return p.slice(5);
     if (/^Numpad\d$/.test(p)) return "Num " + p.slice(6);

@@ -3,7 +3,7 @@
 //!
 //! CONTRACT (used by engine.rs and main.rs). Keep these signatures.
 
-use crate::preset::{AppRef, AppSource, BrowserRef, IfRunning, MonitorRef, OnRestore, WindowState};
+use crate::preset::{AppRef, AppSource, BrowserRef, IfRunning, MonitorRef, OnRestore, SetSite, WindowState};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -19,7 +19,7 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HWND, LPARAM, POINT
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
-    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFOEXW, MonitorFromRect, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
@@ -28,6 +28,7 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, GetProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -47,10 +48,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, IsZoomed, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW, SetForegroundWindow,
     SetWindowPos, ShowWindow, ShowWindowAsync, TranslateMessage, CHILDID_SELF, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
-    EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST,
-    MSG, OBJID_WINDOW, PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WINEVENT_OUTOFCONTEXT, WM_CLOSE,
-    WS_EX_TOOLWINDOW,
+    EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+    MSG, OBJID_WINDOW, PM_REMOVE, QS_ALLINPUT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWNORMAL,
+    WINEVENT_OUTOFCONTEXT, WM_CLOSE, WS_EX_TOOLWINDOW, GetWindowPlacement, SetWindowPlacement, WINDOWPLACEMENT,
+    WPF_RESTORETOMAXIMIZED, WPF_ASYNCWINDOWPLACEMENT, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SHOW_WINDOW_CMD, WS_EX_TOPMOST,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -91,6 +93,131 @@ pub struct OpenedWindow {
     pub pid: u32,
     /// false = the app was already running and its window was brought forward
     pub launched: bool,
+    /// Where an already-open window was before the step moved it.
+    pub before: Option<Placement>,
+}
+
+/// A window's normal (not maximized) position and whether it was maximized.
+#[derive(Clone, Copy, Debug, Serialize, serde::Deserialize, PartialEq)]
+pub struct Placement {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub maximized: bool,
+    /// It was minimized (then `maximized` says how it comes back).
+    #[serde(default)]
+    pub minimized: bool,
+}
+
+pub fn placement_of(hwnd: isize) -> Option<Placement> {
+    let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    unsafe { GetWindowPlacement(hwnd_of(hwnd), &mut wp).ok()? };
+    let r = wp.rcNormalPosition;
+    // A minimized window remembers whether it comes back maximized.
+    let maximized = wp.showCmd == SW_SHOWMAXIMIZED.0 as u32
+        || (wp.showCmd == SW_SHOWMINIMIZED.0 as u32 && wp.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0);
+    let minimized = wp.showCmd == SW_SHOWMINIMIZED.0 as u32 || unsafe { IsIconic(hwnd_of(hwnd)).as_bool() };
+    Some(Placement { left: r.left, top: r.top, right: r.right, bottom: r.bottom, maximized, minimized })
+}
+
+/// Shows the window again where it was (same monitor, size and maximized state), without making
+/// it the active window. Leaves frozen windows alone so a hung app cannot hold up the restore.
+/// Returns false when it left the window alone (gone, or its app is not responding).
+pub fn put_back(opened: &OpenedWindow, p: &Placement) -> bool {
+    unsafe {
+        let h = hwnd_of(opened.hwnd);
+        if !IsWindow(Some(h)).as_bool() || window_pid(h) != opened.pid || !crate::system::answers(opened.hwnd) {
+            return false;
+        }
+        let rect = RECT { left: p.left, top: p.top, right: p.right, bottom: p.bottom };
+        if p.maximized && !p.minimized && IsZoomed(h).as_bool() && !IsIconic(h).as_bool() {
+            let mut now = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            // Placements use workspace coordinates; monitors are found in screen coordinates.
+            let (dx, dy) = workspace_offset(h);
+            let screen = |r: &RECT| RECT { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy };
+            let same_monitor = GetWindowPlacement(h, &mut now).is_ok()
+                && MonitorFromRect(&screen(&now.rcNormalPosition), MONITOR_DEFAULTTONEAREST)
+                    == MonitorFromRect(&screen(&rect), MONITOR_DEFAULTTONEAREST);
+            if !same_monitor {
+                // A maximized window ignores a new normal position; bring it to normal size there first.
+                let wp = WINDOWPLACEMENT {
+                    length: now.length,
+                    showCmd: SW_SHOWNOACTIVATE.0 as u32,
+                    rcNormalPosition: rect,
+                    flags: WPF_ASYNCWINDOWPLACEMENT,
+                    ..Default::default()
+                };
+                let _ = SetWindowPlacement(h, &wp);
+                let _ = ShowWindowAsync(h, SW_MAXIMIZE);
+                return true;
+            }
+        }
+        let show = if p.minimized {
+            SW_SHOWMINNOACTIVE
+        } else if p.maximized {
+            SW_SHOWMAXIMIZED
+        } else {
+            SW_SHOWNOACTIVATE
+        };
+        let wp = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            showCmd: show.0 as u32,
+            rcNormalPosition: rect,
+            // Async: an app that stops answering now can't hold up the rest of the undo.
+            flags: if p.minimized && p.maximized { WPF_RESTORETOMAXIMIZED | WPF_ASYNCWINDOWPLACEMENT } else { WPF_ASYNCWINDOWPLACEMENT },
+            ..Default::default()
+        };
+        let _ = SetWindowPlacement(h, &wp);
+        true
+    }
+}
+
+/// What an app resolves to, to tell whether two 앱 열기 steps could claim each other's windows.
+#[derive(Clone, Debug, Default)]
+pub struct AppIdentity {
+    aumid: Option<String>,
+    exe: Option<String>,
+}
+
+/// Programs that host windows of many apps (browsers and their web apps, script runtimes, shells).
+const SHARED_HOSTS: &[&str] = &[
+    "chrome.exe", "chrome_proxy.exe", "msedge.exe", "msedge_proxy.exe", "firefox.exe", "whale.exe", "brave.exe",
+    "javaw.exe", "java.exe", "pythonw.exe", "python.exe", "applicationframehost.exe", "explorer.exe", "update.exe",
+    "cmd.exe", "powershell.exe", "pwsh.exe", "wt.exe", "rundll32.exe",
+];
+
+impl AppIdentity {
+    /// True when the two may share windows, so they must open one after the other.
+    pub fn overlaps(&self, other: &AppIdentity) -> bool {
+        let unknown = |a: &AppIdentity| a.aumid.is_none() && a.exe.is_none();
+        let shared = |a: &AppIdentity| a.exe.as_deref().is_some_and(|e| SHARED_HOSTS.contains(&e));
+        if unknown(self) || unknown(other) || shared(self) || shared(other) {
+            return true;
+        }
+        if let (Some(a), Some(b)) = (&self.exe, &other.exe) {
+            if a == b {
+                return true;
+            }
+        }
+        if let (Some(a), Some(b)) = (&self.aumid, &other.aumid) {
+            let (a, b) = (a.to_lowercase(), b.to_lowercase());
+            // "Chrome" and its web apps ("Chrome._crx_…") share windows.
+            if a.starts_with(&b) || b.starts_with(&a) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub fn app_identity(app: &AppRef) -> AppIdentity {
+    let app = app.clone();
+    on_sta(move || unsafe {
+        let m = matcher_for(&app);
+        AppIdentity { aumid: m.aumid, exe: m.exe }
+    })
+    .unwrap_or_default()
 }
 
 /// How long open_app waits for a new app window.
@@ -557,13 +684,21 @@ impl Matcher {
         if pid == 0 {
             return false;
         }
+        if self.matches_process(pid) {
+            return true;
+        }
+        // Store apps hosted by ApplicationFrameHost carry their AUMID on the window only.
+        self.aumid.as_ref().is_some_and(|a| window_aumid(hwnd).is_some_and(|w| w.eq_ignore_ascii_case(a)))
+    }
+
+    /// The process itself is the app: same id, AUMID or program file.
+    unsafe fn matches_process(&self, pid: u32) -> bool {
         if self.pid == Some(pid) {
             return true;
         }
         let (proc_aumid, exe) = self.cache.borrow_mut().entry(pid).or_insert_with(|| process_identity(pid)).clone();
-        if let Some(a) = &self.aumid {
-            let same = |x: &Option<String>| x.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(a));
-            if same(&proc_aumid) || same(&window_aumid(hwnd)) {
+        if let (Some(a), Some(p)) = (&self.aumid, &proc_aumid) {
+            if a.eq_ignore_ascii_case(p) {
                 return true;
             }
         }
@@ -604,12 +739,362 @@ pub fn app_windows(app: &AppRef) -> Vec<isize> {
     on_sta(move || unsafe { matching_windows(&matcher_for(&app)) }).unwrap_or_default()
 }
 
+/// True when `app` has a window open or a process running (e.g. waiting in the tray).
+pub fn app_running(app: &AppRef) -> bool {
+    let app = app.clone();
+    on_sta(move || unsafe {
+        let m = matcher_for(&app);
+        if !matching_windows(&m).is_empty() {
+            return true;
+        }
+        let mut pids = vec![0u32; 4096];
+        let mut bytes = 0u32;
+        let size = (pids.len() * std::mem::size_of::<u32>()) as u32;
+        if EnumProcesses(pids.as_mut_ptr(), size, &mut bytes).is_err() {
+            return false;
+        }
+        pids.truncate(bytes as usize / std::mem::size_of::<u32>());
+        pids.into_iter().any(|pid| pid != 0 && m.matches_process(pid))
+    })
+    .unwrap_or(false)
+}
+
+/// Ids of the running processes that are `m`'s app.
+unsafe fn matching_pids(m: &Matcher) -> HashSet<u32> {
+    let mut pids = vec![0u32; 4096];
+    let mut bytes = 0u32;
+    let size = (pids.len() * std::mem::size_of::<u32>()) as u32;
+    if EnumProcesses(pids.as_mut_ptr(), size, &mut bytes).is_err() {
+        return HashSet::new();
+    }
+    pids.truncate(bytes as usize / std::mem::size_of::<u32>());
+    pids.into_iter().filter(|&pid| pid != 0 && m.matches_process(pid)).collect()
+}
+
+/// Every top-level window of these processes, hidden ones included.
+unsafe fn windows_of(pids: &HashSet<u32>) -> HashSet<isize> {
+    if pids.is_empty() {
+        return HashSet::new();
+    }
+    let mut all: Vec<isize> = Vec::new();
+    unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
+        (*(data.0 as *mut Vec<isize>)).push(hwnd.0 as isize);
+        true.into()
+    }
+    let _ = EnumWindows(Some(collect), LPARAM(&mut all as *mut _ as isize));
+    all.into_iter().filter(|&h| pids.contains(&window_pid(hwnd_of(h)))).collect()
+}
+
+/// True when the app runs with no window up, as tray apps do, and is not a browser or other shared
+/// program (those often run in the background without being "open").
+pub fn app_in_tray(app: &AppRef) -> bool {
+    let app = app.clone();
+    on_sta(move || unsafe {
+        let m = matcher_for(&app);
+        if m.exe.as_deref().is_some_and(|e| SHARED_HOSTS.contains(&e)) {
+            return false;
+        }
+        matching_windows(&m).is_empty() && !matching_pids(&m).is_empty()
+    })
+    .unwrap_or(false)
+}
+
+/// Brings `hwnds` up: minimized ones are restored, all are raised, and the first ends in front.
+/// Returns the ones that were minimized, so they can be minimized again later.
+pub fn show_windows(hwnds: &[isize]) -> Vec<isize> {
+    let mut restored = Vec::new();
+    unsafe {
+        for &h in hwnds.iter().rev() {
+            let hwnd = hwnd_of(h);
+            if !IsWindow(Some(hwnd)).as_bool() {
+                continue;
+            }
+            if IsIconic(hwnd).as_bool() {
+                // Async: a frozen app must not hold up the others.
+                let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                restored.push(h);
+            }
+            let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        }
+        if let Some(&first) = hwnds.first() {
+            if IsWindow(Some(hwnd_of(first))).as_bool() {
+                bring_front(hwnd_of(first));
+            }
+        }
+    }
+    restored.reverse();
+    restored
+}
+
+/// An app with a window open right now, as a step can name it. Browser windows whose page could
+/// be read come as `site` (one per window) instead of `app`.
+#[derive(Clone, Debug, Serialize)]
+pub struct OpenWindowApp {
+    pub app: Option<AppRef>,
+    pub site: Option<SetSite>,
+    /// Full program path, for its icon. Empty when Windows does not tell (e.g. an elevated app).
+    pub path: String,
+}
+
+/// The apps whose windows are open now, front-most first, one entry per app (for "창 세트").
+/// File Explorer (also the desktop and taskbar) and Keyscene itself are left out.
+pub fn open_window_apps() -> Vec<OpenWindowApp> {
+    on_sta(|| unsafe {
+        let mut all: Vec<isize> = Vec::new();
+        unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
+            (*(data.0 as *mut Vec<isize>)).push(hwnd.0 as isize);
+            true.into()
+        }
+        let _ = EnumWindows(Some(collect), LPARAM(&mut all as *mut _ as isize));
+        let own = std::process::id();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for h in all {
+            let hwnd = hwnd_of(h);
+            let pid = window_pid(hwnd);
+            if !is_candidate(hwnd) || IsIconic(hwnd).as_bool() || pid == own {
+                continue;
+            }
+            let (proc_aumid, exe) = process_identity(pid);
+            let Some(exe) = exe else { continue };
+            if exe == "explorer.exe" {
+                continue;
+            }
+            let mut buf = [0u16; 256];
+            let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buf);
+            let title = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+            let path = process_path(pid).unwrap_or_default();
+            // Each browser window on its own, known by the page it shows.
+            if let Some(browser) = browser_of_exe(&exe) {
+                if let Some(url) = browser_url(hwnd) {
+                    let page = title.rsplit_once(" - ").map_or(title.as_str(), |(page, _)| page).trim().to_string();
+                    let site = SetSite { url, browser: BrowserRef { browser: browser.into(), ..Default::default() }, title: page };
+                    remember_site_window(&site, h);
+                    out.push(OpenWindowApp { app: None, site: Some(site), path });
+                    continue;
+                }
+            }
+            // Store apps (and packaged desktop apps) are opened by their AUMID; others by their program.
+            let aumid = window_aumid(hwnd).filter(|a| a.contains('!')).or(proc_aumid);
+            let (source, id) = match aumid {
+                Some(a) => (AppSource::Installed, a),
+                None if !path.is_empty() => (AppSource::File, path.clone()),
+                None => continue,
+            };
+            if exe == "applicationframehost.exe" && source == AppSource::File {
+                continue; // a Store app window whose app could not be told
+            }
+            if !seen.insert(id.to_lowercase()) {
+                continue;
+            }
+            let name = title.rsplit(" - ").next().unwrap_or(&title).trim().to_string();
+            let name = if name.is_empty() { exe.trim_end_matches(".exe").to_string() } else { name };
+            out.push(OpenWindowApp { app: Some(AppRef { source, id, name, args: String::new() }), site: None, path });
+        }
+        out
+    })
+    .unwrap_or_default()
+}
+
+// ---------- browser windows in a window set ----------
+
+/// "chrome" / "edge" for their program files; other browsers are handled as plain apps.
+fn browser_of_exe(exe: &str) -> Option<&'static str> {
+    match exe {
+        "chrome.exe" => Some("chrome"),
+        "msedge.exe" => Some("edge"),
+        _ => None,
+    }
+}
+
+fn exe_of_browser(browser: &str) -> Option<&'static str> {
+    match browser {
+        "chrome" => Some("chrome.exe"),
+        "edge" => Some("msedge.exe"),
+        _ => None,
+    }
+}
+
+/// The browser that opens web links: "chrome" or "edge" when it is one of them.
+fn default_browser() -> Option<&'static str> {
+    const KEY: &str = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice";
+    let prog = crate::reg::read_string(windows_sys::Win32::System::Registry::HKEY_CURRENT_USER, KEY, "ProgId")?;
+    let p = prog.to_lowercase();
+    if p.starts_with("chromehtml") {
+        Some("chrome")
+    } else if p.starts_with("msedgehtm") {
+        Some("edge")
+    } else {
+        None
+    }
+}
+
+/// The site's browser, with "default" resolved to the real one when that is Chrome or Edge.
+fn site_browser(site: &SetSite) -> Option<&'static str> {
+    match site.browser.browser.as_str() {
+        "chrome" => Some("chrome"),
+        "edge" => Some("edge"),
+        _ => default_browser(),
+    }
+}
+
+/// The address in a Chrome/Edge window's address bar (its current tab), read with UI Automation.
+/// None for an empty bar (new tab page) or a browser page such as chrome://settings.
+unsafe fn browser_url(hwnd: HWND) -> Option<String> {
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
+        UIA_EditControlTypeId, UIA_ValuePatternId,
+    };
+    let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+    let root = uia.ElementFromHandle(hwnd).ok()?;
+    // The address bar is the first edit box in the browser's own toolbar, ahead of the page.
+    let edit_boxes = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_EditControlTypeId.0)).ok()?;
+    let bar = root.FindFirst(TreeScope_Descendants, &edit_boxes).ok()?;
+    let value: IUIAutomationValuePattern = bar.GetCurrentPatternAs(UIA_ValuePatternId).ok()?;
+    web_address(&value.CurrentValue().ok()?.to_string())
+}
+
+/// What the address bar shows -> a full web address. The bar often hides "https://".
+fn web_address(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() || t.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let lower = t.to_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(t.to_string());
+    }
+    if lower.contains("://") || lower.starts_with("about:") || lower.starts_with("file:") || !lower.contains('.') {
+        return None;
+    }
+    Some(format!("https://{t}"))
+}
+
+/// "https://www.YouTube.com/watch?v=1" -> "youtube.com". Two windows are the same site when these match.
+pub fn url_host(url: &str) -> Option<String> {
+    let lower = url.trim().to_lowercase();
+    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
+    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?.split(':').next()?;
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// The window last seen showing each site (recorded or opened by Keyscene), so a set finds that
+/// exact window again even when another window shows the same site. Forgotten on restart.
+static SITE_WINDOWS: std::sync::Mutex<Vec<(String, isize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+fn site_key(site: &SetSite) -> String {
+    format!("{}|{}", site_browser(site).unwrap_or("default"), site.url.trim().to_lowercase())
+}
+
+fn remember_site_window(site: &SetSite, hwnd: isize) {
+    let key = site_key(site);
+    let pid = unsafe { window_pid(hwnd_of(hwnd)) };
+    let mut map = SITE_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|(k, h, _)| *k != key && *h != hwnd);
+    map.push((key, hwnd, pid));
+}
+
+/// Browser windows of `browser` ("chrome"/"edge"; None = both), front-most first.
+unsafe fn browser_windows(browser: Option<&str>) -> Vec<isize> {
+    let exes: Vec<&str> = match browser {
+        Some(b) => exe_of_browser(b).into_iter().collect(),
+        None => vec!["chrome.exe", "msedge.exe"],
+    };
+    let mut all = Vec::new();
+    for exe in exes {
+        let m = Matcher { aumid: None, exe: Some(exe.into()), pid: None, cache: RefCell::new(HashMap::new()) };
+        all.extend(matching_windows(&m));
+    }
+    all
+}
+
+/// The browser window that shows `site`: the one remembered for it if it is still open,
+/// otherwise a window whose current page is on the same site. Windows in `taken` are skipped.
+pub fn site_window(site: &SetSite, taken: &HashSet<isize>) -> Option<isize> {
+    let (site, taken) = (site.clone(), taken.clone());
+    on_sta(move || unsafe {
+        let key = site_key(&site);
+        let remembered = SITE_WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, ..)| *k == key).map(|(_, h, p)| (*h, *p));
+        if let Some((h, pid)) = remembered {
+            if !taken.contains(&h) && IsWindow(Some(hwnd_of(h))).as_bool() && window_pid(hwnd_of(h)) == pid && is_candidate(hwnd_of(h)) {
+                return Some(h);
+            }
+        }
+        let want = url_host(&site.url)?;
+        let open: Vec<(isize, String)> = browser_windows(site_browser(&site))
+            .into_iter()
+            .filter(|h| !taken.contains(h))
+            .filter_map(|h| browser_url(hwnd_of(h)).map(|u| (h, u)))
+            .collect();
+        // The same page first (two sets may hold different pages of one site), then the same site.
+        let page = url_page(&site.url);
+        let found = open
+            .iter()
+            .find(|(_, u)| page.is_some() && url_page(u) == page)
+            .or_else(|| open.iter().find(|(_, u)| url_host(u).as_deref() == Some(want.as_str())))
+            .map(|(h, _)| *h)?;
+        remember_site_window(&site, found);
+        Some(found)
+    })
+    .flatten()
+}
+
+/// Sites opened in a browser whose windows can't be read (not Chrome or Edge).
+static UNTRACKED_SITES: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Host and path of a web address, without scheme, "www.", query, fragment or a trailing slash.
+fn url_page(url: &str) -> Option<String> {
+    let host = url_host(url)?;
+    let lower = url.trim().to_lowercase();
+    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
+    let path = rest.split_once('/').map_or("", |(_, p)| p);
+    let path = path.split(['?', '#']).next().unwrap_or("").trim_end_matches('/');
+    Some(format!("{host}/{path}"))
+}
+
+/// Opens `site` in a new browser window and returns that window once it appears (up to 20 s).
+/// With a default browser other than Chrome or Edge, the page opens but its window is not tracked.
+pub fn open_site(site: &SetSite) -> Result<Option<isize>, String> {
+    let url = validate_url(&site.url)?;
+    let Some(browser) = site_browser(site) else {
+        // Its window can't be found again, so open it once per run of Keyscene, not on every press.
+        let mut opened = UNTRACKED_SITES.lock().unwrap_or_else(|e| e.into_inner());
+        if !opened.contains(&url) {
+            open_url(&url, &site.browser, true, false)?;
+            opened.insert(url);
+        }
+        return Ok(None);
+    };
+    let site = site.clone();
+    on_sta(move || unsafe {
+        let exe = exe_of_browser(browser).map(String::from);
+        let matcher = Matcher { aumid: None, exe, pid: None, cache: RefCell::new(HashMap::new()) };
+        let existing = matching_windows(&matcher);
+        WAIT.with(|w| *w.borrow_mut() = Some(Wait { matcher, exclude: existing.into_iter().collect(), found: None, reused: None }));
+        let hooks = Hooks::install();
+        let pick = BrowserRef { browser: browser.into(), ..site.browser.clone() };
+        let result = open_url(&url, &pick, true, false).map(|_| pump_until_found(Instant::now() + WINDOW_TIMEOUT));
+        drop(hooks);
+        WAIT.with(|w| *w.borrow_mut() = None);
+        let found = result?;
+        if let Some(h) = found {
+            remember_site_window(&site, h);
+        }
+        Ok(found)
+    })
+    .unwrap_or_else(|| Err("웹사이트를 여는 중 문제가 생겼습니다.".into()))
+}
+
 // ---------- waiting for a new window (event driven) ----------
 
 struct Wait {
     matcher: Matcher,
     exclude: HashSet<isize>,
     found: Option<isize>,
+    /// An existing window the app brought forward instead of opening one (single instance).
+    reused: Option<isize>,
 }
 
 thread_local! {
@@ -618,7 +1103,7 @@ thread_local! {
 
 unsafe extern "system" fn on_win_event(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     hwnd: HWND,
     id_object: i32,
     id_child: i32,
@@ -634,6 +1119,11 @@ unsafe extern "system" fn on_win_event(
                 let h = hwnd.0 as isize;
                 if st.found.is_none() && !st.exclude.contains(&h) && is_candidate(hwnd) && st.matcher.matches(hwnd) {
                     st.found = Some(h);
+                } else if event == EVENT_SYSTEM_FOREGROUND && st.exclude.contains(&h) {
+                    // A minimized one coming up is more likely 바탕 화면 보기 or the user than the app.
+                    if !IsIconic(hwnd).as_bool() {
+                        st.reused = Some(h);
+                    }
                 }
             }
         }
@@ -666,11 +1156,17 @@ impl Drop for Hooks {
 }
 
 /// Pumps this thread's messages (window events arrive that way) until a match or the deadline.
-unsafe fn pump_until_found(deadline: Instant) -> Option<isize> {
+unsafe fn pump_until_found(mut deadline: Instant) -> Option<isize> {
+    let mut reuse_seen = false;
     loop {
-        let found = WAIT.with(|w| w.borrow().as_ref().and_then(|s| s.found));
+        let (found, reused) = WAIT.with(|w| w.borrow().as_ref().map_or((None, false), |s| (s.found, s.reused.is_some())));
         if found.is_some() {
             return found;
+        }
+        // A single-instance app just showed its old window: give a new one a moment, then stop waiting.
+        if reused && !reuse_seen {
+            reuse_seen = true;
+            deadline = deadline.min(Instant::now() + Duration::from_millis(4000));
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -739,16 +1235,21 @@ pub fn open_app(app: &AppRef, if_running: IfRunning, monitor: &MonitorRef, windo
 unsafe fn open_app_sta(app: &AppRef, if_running: IfRunning, monitor: &MonitorRef, window: WindowState) -> Result<OpenedWindow, String> {
     let matcher = matcher_for(app);
     let existing = matching_windows(&matcher);
+    // Where each open window is now: the app may bring forward another one than the front-most.
+    let places: HashMap<isize, Placement> = existing.iter().filter_map(|&h| placement_of(h).map(|p| (h, p))).collect();
     if if_running == IfRunning::Front {
         if let Some(&h) = existing.first() {
-            finish(hwnd_of(h), monitor, window);
-            return Ok(OpenedWindow { hwnd: h, pid: window_pid(hwnd_of(h)), launched: false });
+            finish(hwnd_of(h), monitor, window, false);
+            return Ok(OpenedWindow { hwnd: h, pid: window_pid(hwnd_of(h)), launched: false, before: places.get(&h).copied() });
         }
     }
+    // Processes already running: a window they show now (e.g. one hidden in the tray or on another
+    // desktop) was not opened by this step, so restore must never close it.
+    let old_windows = windows_of(&matching_pids(&matcher));
 
     // Hooks go in before launching so a fast window is not missed.
     WAIT.with(|w| {
-        *w.borrow_mut() = Some(Wait { matcher, exclude: existing.iter().copied().collect(), found: None });
+        *w.borrow_mut() = Some(Wait { matcher, exclude: existing.iter().copied().collect(), found: None, reused: None });
     });
     let hooks = Hooks::install();
     let result = (|| {
@@ -768,28 +1269,39 @@ unsafe fn open_app_sta(app: &AppRef, if_running: IfRunning, monitor: &MonitorRef
         Ok::<_, String>(pump_until_found(Instant::now() + WINDOW_TIMEOUT))
     })();
     drop(hooks);
-    WAIT.with(|w| *w.borrow_mut() = None);
+    let reused = WAIT.with(|w| w.borrow_mut().take().and_then(|s| s.reused));
 
     // Single-instance apps reuse their existing window instead of opening another.
-    // That window was open before the preset, so it is not counted as one the preset opened.
+    // That window was open before the preset, so it is not counted as one the preset opened;
+    // nor is a window that existed hidden (in the tray, on another desktop) and was shown now.
     let (hwnd, launched) = match result? {
-        Some(h) => (h, true),
+        Some(h) => (h, !old_windows.contains(&h)),
         None => (
-            existing.first().copied().ok_or_else(|| format!("'{}'의 창을 20초 안에 찾지 못했습니다.", app.name))?,
+            reused
+                .or_else(|| existing.first().copied())
+                .ok_or_else(|| format!("'{}'의 창을 20초 안에 찾지 못했습니다.", app.name))?,
             false,
         ),
     };
-    finish(hwnd_of(hwnd), monitor, window);
-    Ok(OpenedWindow { hwnd, pid: window_pid(hwnd_of(hwnd)), launched })
+    // Only a window that was already up has a place to go back to; a new window of a running app
+    // (or one it brought out of the tray) is just minimized on restore, never closed.
+    let new_window = !existing.contains(&hwnd);
+    let before = if launched || new_window { None } else { places.get(&hwnd).copied() };
+    finish(hwnd_of(hwnd), monitor, window, new_window);
+    Ok(OpenedWindow { hwnd, pid: window_pid(hwnd_of(hwnd)), launched, before })
 }
 
-unsafe fn finish(hwnd: HWND, monitor: &MonitorRef, window: WindowState) {
-    place(hwnd, monitor, window);
-    if window != WindowState::AppDefault || !matches!(monitor, MonitorRef::AppDefault) {
-        // Some apps restore their own saved position right after showing; check once and fix.
-        std::thread::sleep(Duration::from_millis(600));
-        if !placed(hwnd, monitor, window) {
-            place(hwnd, monitor, window);
+/// `fresh`: the window just appeared. Such a window may still move itself to a saved position, so
+/// it is always checked again; a window that was already up and in place is left alone (no flash).
+unsafe fn finish(hwnd: HWND, monitor: &MonitorRef, window: WindowState, fresh: bool) {
+    if fresh || !placed(hwnd, monitor, window) {
+        place(hwnd, monitor, window);
+        if window != WindowState::AppDefault || !matches!(monitor, MonitorRef::AppDefault) {
+            // Some apps restore their own saved position right after showing; check once and fix.
+            std::thread::sleep(Duration::from_millis(600));
+            if !placed(hwnd, monitor, window) {
+                place(hwnd, monitor, window);
+            }
         }
     }
     if window != WindowState::Minimized {
@@ -868,37 +1380,74 @@ unsafe fn set_visible_rect(hwnd: HWND, want: &RECT) {
     );
 }
 
+/// Offset between screen coordinates and the "workspace" coordinates window placements use
+/// (they start at the primary monitor's work area, which moves when the taskbar is on the left or top).
+unsafe fn workspace_offset(hwnd: HWND) -> (i32, i32) {
+    if (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32) & WS_EX_TOOLWINDOW.0 != 0 {
+        return (0, 0);
+    }
+    primary_work().map_or((0, 0), |w| (w.left, w.top))
+}
+
+/// Puts the window centred on `work` (its normal size, shrunk to fit) and shows it as `show`, in one
+/// step: a minimized or maximized window goes straight there, with no stop at its old place.
+unsafe fn move_to(hwnd: HWND, work: &RECT, show: SHOW_WINDOW_CMD) {
+    let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    if GetWindowPlacement(hwnd, &mut wp).is_err() {
+        restore_if_needed(hwnd);
+        move_center(hwnd, work);
+        let _ = ShowWindow(hwnd, show);
+        return;
+    }
+    let (dx, dy) = workspace_offset(hwnd);
+    let n = wp.rcNormalPosition;
+    let w = rect_w(&n).min(rect_w(work));
+    let h = rect_h(&n).min(rect_h(work));
+    let x = work.left + (rect_w(work) - w) / 2 - dx;
+    let y = work.top + (rect_h(work) - h) / 2 - dy;
+    let target = RECT { left: x, top: y, right: x + w, bottom: y + h };
+    if IsZoomed(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+        // A maximized window keeps its monitor when only its normal position changes.
+        wp.rcNormalPosition = target;
+        wp.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+        let _ = SetWindowPlacement(hwnd, &wp);
+        if show != SW_SHOWNOACTIVATE && show != SW_SHOWNORMAL {
+            let _ = ShowWindow(hwnd, show);
+        }
+        return;
+    }
+    wp.rcNormalPosition = target;
+    wp.showCmd = show.0 as u32;
+    let _ = SetWindowPlacement(hwnd, &wp);
+}
+
 unsafe fn place(hwnd: HWND, monitor: &MonitorRef, window: WindowState) {
     let target = target_work(monitor);
     match window {
         WindowState::AppDefault => {
             let Some(work) = target else { return };
-            let was_max = IsZoomed(hwnd).as_bool();
-            restore_if_needed(hwnd);
-            move_center(hwnd, &work);
-            if was_max {
+            let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            let comes_back_max = IsZoomed(hwnd).as_bool()
+                || (IsIconic(hwnd).as_bool() && GetWindowPlacement(hwnd, &mut wp).is_ok() && wp.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0);
+            move_to(hwnd, &work, if comes_back_max { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
+        }
+        WindowState::Maximized => match target {
+            Some(work) => move_to(hwnd, &work, SW_SHOWMAXIMIZED),
+            None => {
                 let _ = ShowWindow(hwnd, SW_MAXIMIZE);
             }
-        }
-        WindowState::Maximized => {
-            if let Some(work) = target {
-                restore_if_needed(hwnd);
-                move_center(hwnd, &work);
+        },
+        WindowState::Minimized => match target {
+            Some(work) => move_to(hwnd, &work, SW_SHOWMINNOACTIVE),
+            None => {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
             }
-            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
-        }
-        WindowState::Minimized => {
-            if let Some(work) = target {
-                restore_if_needed(hwnd);
-                move_center(hwnd, &work);
-            }
-            let _ = ShowWindow(hwnd, SW_MINIMIZE);
-        }
+        },
         WindowState::LeftHalf | WindowState::RightHalf => {
-            restore_if_needed(hwnd);
-            if let Some(work) = target {
+            match target {
                 // Moving first lets a monitor with another scale (DPI) resize the window before the final fit.
-                move_center(hwnd, &work);
+                Some(work) => move_to(hwnd, &work, SW_SHOWNORMAL),
+                None => restore_if_needed(hwnd),
             }
             let Some(work) = target.or_else(|| current_work(hwnd)) else { return };
             set_visible_rect(hwnd, &half(&work, window == WindowState::LeftHalf));
@@ -915,7 +1464,7 @@ unsafe fn placed(hwnd: HWND, monitor: &MonitorRef, window: WindowState) -> bool 
     match window {
         WindowState::AppDefault => on_target(),
         WindowState::Maximized => IsZoomed(hwnd).as_bool() && on_target(),
-        WindowState::Minimized => IsIconic(hwnd).as_bool(),
+        WindowState::Minimized => IsIconic(hwnd).as_bool() && on_target(),
         WindowState::LeftHalf | WindowState::RightHalf => {
             let Some(work) = target_work(monitor).or_else(|| current_work(hwnd)) else { return true };
             let want = half(&work, window == WindowState::LeftHalf);
@@ -948,7 +1497,21 @@ unsafe fn alt_key(up: bool) {
 
 /// Windows only lets the app the user last interacted with take the foreground; these are the usual
 /// permitted ways around it.
+/// Makes the window the active one (in front, with keyboard focus), if it still belongs to `pid`.
+pub fn focus(hwnd: isize, pid: u32) {
+    unsafe {
+        let h = hwnd_of(hwnd);
+        if IsWindow(Some(h)).as_bool() && window_pid(h) == pid && !IsIconic(h).as_bool() {
+            bring_front(h);
+        }
+    }
+}
+
+/// One window switch at a time: several apps open together, and the Alt-key trick below must not interleave.
+static FRONT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 unsafe fn bring_front(hwnd: HWND) {
+    let _one = FRONT.lock().unwrap_or_else(|e| e.into_inner());
     if IsIconic(hwnd).as_bool() {
         let _ = ShowWindow(hwnd, SW_RESTORE);
     }
@@ -967,8 +1530,11 @@ unsafe fn bring_front(hwnd: HWND) {
     let me = GetCurrentThreadId();
     let attached = fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, true).as_bool();
     let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
-    let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
-    let _ = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+    // Skipped for an always-on-top window: the second call would take that away.
+    if (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32) & WS_EX_TOPMOST.0 == 0 {
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+        let _ = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+    }
     let _ = BringWindowToTop(hwnd);
     let _ = SetForegroundWindow(hwnd);
     if attached {
@@ -1038,6 +1604,26 @@ mod tests {
         );
         assert_eq!(browser_args("edge", "", false, true, "https://x.com"), ["--inprivate", "https://x.com"]);
         assert_eq!(browser_args("chrome", "  ", false, false, "https://x.com"), ["https://x.com"]);
+    }
+
+    #[test]
+    fn same_page_ignores_scheme_www_query_and_slash() {
+        assert_eq!(url_page("https://www.docs.google.com/d/1/"), Some("docs.google.com/d/1".into()));
+        assert_eq!(url_page("docs.google.com/d/1?usp=x#y"), url_page("https://docs.google.com/d/1"));
+        assert_ne!(url_page("https://docs.google.com/d/1"), url_page("https://docs.google.com/d/2"));
+    }
+
+    #[test]
+    fn address_bar_text() {
+        assert_eq!(web_address("youtube.com/watch?v=1").as_deref(), Some("https://youtube.com/watch?v=1"));
+        assert_eq!(web_address("http://localhost.x:8080").as_deref(), Some("http://localhost.x:8080"));
+        for none in ["", "chrome://settings", "edge://newtab", "about:blank", "검색어 두 개", "localhost"] {
+            assert_eq!(web_address(none), None, "{none}");
+        }
+        assert_eq!(url_host("https://www.YouTube.com/watch?v=1").as_deref(), Some("youtube.com"));
+        assert_eq!(url_host("https://user@mail.google.com:443/x").as_deref(), Some("mail.google.com"));
+        assert_eq!(url_host("docs.google.com").as_deref(), Some("docs.google.com"));
+        assert_eq!(url_host("https://"), None);
     }
 
     #[test]
@@ -1139,6 +1725,28 @@ unsafe fn process_path(pid: u32) -> Option<String> {
         .map(|_| String::from_utf16_lossy(&buf[..size as usize]));
     let _ = CloseHandle(h);
     path
+}
+
+/// The window as media sessions see it: the names its app may use, lowercase (the program name
+/// without ".exe" and its AUMID), and its title. See `system::pause_media`.
+pub fn media_window(hwnd: isize) -> crate::system::MediaWindow {
+    on_sta(move || unsafe {
+        let h = hwnd_of(hwnd);
+        let (proc_aumid, exe) = process_identity(window_pid(h));
+        let mut ids: Vec<String> = Vec::new();
+        ids.extend(exe.map(|e| e.trim_end_matches(".exe").to_string()));
+        ids.extend(proc_aumid.map(|a| a.to_lowercase()));
+        ids.extend(window_aumid(h).map(|a| a.to_lowercase()));
+        let mut buf = [0u16; 512];
+        let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(h, &mut buf);
+        crate::system::MediaWindow { ids, title: String::from_utf16_lossy(&buf[..len.max(0) as usize]) }
+    })
+    .unwrap_or(crate::system::MediaWindow { ids: Vec::new(), title: String::new() })
+}
+
+/// Program file name (lowercase) of a process.
+pub fn process_exe(pid: u32) -> Option<String> {
+    unsafe { process_identity(pid).1 }
 }
 
 /// Program file name (lowercase) of the process that owns `hwnd`.

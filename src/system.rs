@@ -185,6 +185,26 @@ fn code_to_vk(code: &str) -> Option<VIRTUAL_KEY> {
         "PageDown" => VK_NEXT,
         "PrintScreen" => VK_SNAPSHOT,
         "CapsLock" => VK_CAPITAL,
+        "NumLock" => VK_NUMLOCK,
+        "ScrollLock" => VK_SCROLL,
+        "Pause" => VK_PAUSE,
+        "ContextMenu" => VK_APPS,
+        // 한/영, 한자
+        "Lang1" => VK_HANGUL,
+        "Lang2" => VK_HANJA,
+        "NumpadAdd" => VK_ADD,
+        "NumpadSubtract" => VK_SUBTRACT,
+        "NumpadMultiply" => VK_MULTIPLY,
+        "NumpadDivide" => VK_DIVIDE,
+        "NumpadDecimal" => VK_DECIMAL,
+        "NumpadEnter" => VK_RETURN,
+        "AudioVolumeUp" => VK_VOLUME_UP,
+        "AudioVolumeDown" => VK_VOLUME_DOWN,
+        "AudioVolumeMute" => VK_VOLUME_MUTE,
+        "MediaPlayPause" => VK_MEDIA_PLAY_PAUSE,
+        "MediaTrackNext" => VK_MEDIA_NEXT_TRACK,
+        "MediaTrackPrevious" => VK_MEDIA_PREV_TRACK,
+        "MediaStop" => VK_MEDIA_STOP,
         "Backquote" => VK_OEM_3,
         "Minus" => VK_OEM_MINUS,
         "Equal" => VK_OEM_PLUS,
@@ -198,6 +218,9 @@ fn code_to_vk(code: &str) -> Option<VIRTUAL_KEY> {
         "Slash" => VK_OEM_2,
         c if c.starts_with("Key") && c.len() == 4 && c.as_bytes()[3].is_ascii_alphabetic() => VIRTUAL_KEY(c.as_bytes()[3].to_ascii_uppercase() as u16),
         c if c.starts_with("Digit") && c.len() == 6 && c.as_bytes()[5].is_ascii_digit() => VIRTUAL_KEY(c.as_bytes()[5] as u16),
+        c if c.starts_with("Numpad") && c.len() == 7 && c.as_bytes()[6].is_ascii_digit() => {
+            VIRTUAL_KEY(VK_NUMPAD0.0 + (c.as_bytes()[6] - b'0') as u16)
+        }
         c if c.starts_with('F') && c[1..].parse::<u16>().is_ok_and(|n| (1..=24).contains(&n)) => {
             VIRTUAL_KEY(VK_F1.0 + c[1..].parse::<u16>().unwrap() - 1)
         }
@@ -224,24 +247,45 @@ pub fn send_keys(spec: &str) -> Result<(), String> {
 }
 
 /// Types text as Unicode characters (works with any keyboard layout, including Korean).
+/// A line break is typed as the Enter key and a tab as the Tab key: as characters, many programs
+/// (browsers, chat apps) drop them.
 pub fn type_text(text: &str) -> Result<(), String> {
     check_foreground_accepts_input()?;
     release_held_modifiers();
+    send(&text_inputs(text));
+    Ok(())
+}
+
+fn text_inputs(text: &str) -> Vec<INPUT> {
     let mut inputs = Vec::new();
-    for unit in text.encode_utf16() {
-        for up in [false, true] {
-            let mut flags = KEYEVENTF_UNICODE;
-            if up {
-                flags |= KEYEVENTF_KEYUP;
+    // "\r\n" and a lone "\r" count as one line break.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    for ch in text.chars() {
+        let key = match ch {
+            '\n' => Some(VK_RETURN),
+            '\t' => Some(VK_TAB),
+            _ => None,
+        };
+        if let Some(vk) = key {
+            inputs.push(key_input(vk, false));
+            inputs.push(key_input(vk, true));
+            continue;
+        }
+        let mut units = [0u16; 2];
+        for unit in ch.encode_utf16(&mut units) {
+            for up in [false, true] {
+                let mut flags = KEYEVENTF_UNICODE;
+                if up {
+                    flags |= KEYEVENTF_KEYUP;
+                }
+                inputs.push(INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: *unit, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+                });
             }
-            inputs.push(INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
-            });
         }
     }
-    send(&inputs);
-    Ok(())
+    inputs
 }
 
 /// Windows silently drops keys sent to a program running with more rights than Keyscene
@@ -255,21 +299,23 @@ fn check_foreground_accepts_input() -> Result<(), String> {
 }
 
 fn foreground_is_elevated_above_us() -> bool {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid)) };
+    elevated_above_us(pid)
+}
+
+/// True when the process runs with more rights than Keyscene ("Run as administrator").
+/// Windows then ignores Keyscene's keys and window commands for it.
+fn elevated_above_us(pid: u32) -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     unsafe {
-        if is_elevated(GetCurrentProcess()) == Some(true) {
+        if pid == 0 || is_elevated(GetCurrentProcess()) == Some(true) {
             return false;
         }
-        let hwnd = GetForegroundWindow();
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 {
-            return false;
-        }
-        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false };
-        // An elevated program's token can't be read from a normal one: that refusal itself
-        // means it runs with more rights.
+        // A program Windows won't even let us look at runs with more rights (another user's
+        // elevated program, a protected process); so does one whose rights can't be read.
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return true };
         let elevated = is_elevated(process).unwrap_or(true);
         let _ = CloseHandle(process);
         elevated
@@ -307,11 +353,204 @@ pub fn screenshot() {
     let _ = send_keys("Super+Shift+KeyS");
 }
 
+/// Turns the sound of whole programs off or on, like the volume mixer, on the default speaker.
+/// `exes` are lowercase program file names. Returns the ones whose sound actually changed.
+pub fn set_apps_muted(exes: &std::collections::BTreeSet<String>, mute: bool) -> Vec<String> {
+    set_apps_muted_found(exes, mute).0
+}
+
+/// Like `set_apps_muted`, and also returns the programs that had a sound session at all (a program
+/// that isn't running can't be changed now).
+pub fn set_apps_muted_found(exes: &std::collections::BTreeSet<String>, mute: bool) -> (Vec<String>, std::collections::BTreeSet<String>) {
+    let mut found = std::collections::BTreeSet::new();
+    let changed = apps_muted(exes, mute, &mut found);
+    (changed, found)
+}
+
+fn apps_muted(exes: &std::collections::BTreeSet<String>, mute: bool, found: &mut std::collections::BTreeSet<String>) -> Vec<String> {
+    use windows::core::Interface;
+    use windows::Win32::Media::Audio::{IAudioSessionControl2, IAudioSessionManager2, ISimpleAudioVolume};
+    let mut changed: Vec<String> = Vec::new();
+    if exes.is_empty() {
+        return changed;
+    }
+    unsafe {
+        let Ok(devices) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else { return changed };
+        let Ok(device) = devices.GetDefaultAudioEndpoint(eRender, eConsole) else { return changed };
+        let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { return changed };
+        let Ok(sessions) = manager.GetSessionEnumerator() else { return changed };
+        for i in 0..sessions.GetCount().unwrap_or(0) {
+            let Ok(session) = sessions.GetSession(i) else { continue };
+            let Ok(control) = session.cast::<IAudioSessionControl2>() else { continue };
+            let Ok(pid) = control.GetProcessId() else { continue };
+            // A browser plays sound from a helper process with the same program file.
+            let Some(exe) = crate::launch::process_exe(pid).filter(|e| exes.contains(e)) else { continue };
+            found.insert(exe.clone());
+            let Ok(volume) = session.cast::<ISimpleAudioVolume>() else { continue };
+            let now = volume.GetMute().map(|b| b.as_bool()).unwrap_or(mute);
+            if now != mute && volume.SetMute(mute, std::ptr::null()).is_ok() && !changed.contains(&exe) {
+                changed.push(exe);
+            }
+        }
+    }
+    changed
+}
+
+// ---------- media sessions (play/pause per app) ----------
+
+/// The media sessions Windows lists (what the play/pause key controls), with the app id of each.
+fn media_sessions() -> Vec<(String, windows::Media::Control::GlobalSystemMediaTransportControlsSession)> {
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as Manager;
+    let Ok(manager) = Manager::RequestAsync().and_then(|op| op.join()) else { return Vec::new() };
+    let Ok(sessions) = manager.GetSessions() else { return Vec::new() };
+    let count = sessions.Size().unwrap_or(0);
+    (0..count)
+        .filter_map(|i| sessions.GetAt(i).ok())
+        .filter_map(|s| s.SourceAppUserModelId().ok().map(|id| (id.to_string().to_lowercase(), s)))
+        .collect()
+}
+
+/// A window as media sessions see it: the names its app may use (see `launch::media_window`)
+/// and its title, which for a browser holds the page (and so the video) title.
+pub struct MediaWindow {
+    pub ids: Vec<String>,
+    pub title: String,
+}
+
+impl MediaWindow {
+    fn is_app(&self, id: &str) -> bool {
+        let stem = id.trim_end_matches(".exe");
+        self.ids.iter().any(|x| x == id || x == stem)
+    }
+
+    fn shows(&self, media_title: &str) -> bool {
+        !media_title.is_empty() && self.title.to_lowercase().contains(&media_title.to_lowercase())
+    }
+}
+
+/// A session Keyscene paused: its app id and the title of what was playing.
+pub type PausedMedia = (String, String);
+
+fn media_title(session: &windows::Media::Control::GlobalSystemMediaTransportControlsSession) -> String {
+    session.TryGetMediaPropertiesAsync().and_then(|op| op.join()).and_then(|p| p.Title()).map(|t| t.to_string()).unwrap_or_default()
+}
+
+/// False for media with no known length, which is how live streams report themselves: pausing a
+/// live stream only makes it fall behind, so it keeps playing (its sound can still be turned off).
+fn has_length(session: &windows::Media::Control::GlobalSystemMediaTransportControlsSession) -> bool {
+    session
+        .GetTimelineProperties()
+        .and_then(|t| Ok(t.EndTime()?.Duration - t.StartTime()?.Duration))
+        .is_ok_and(|length| length > 0)
+}
+
+/// Whether a playing session belongs to the windows being put away rather than the ones shown.
+/// A browser has one app for all its windows, so there the window whose title holds the media's
+/// title decides; other apps are decided by the app alone.
+fn belongs_to_hidden(id: &str, title: &str, hidden: &[MediaWindow], shown: &[MediaWindow]) -> bool {
+    if shown.iter().any(|w| w.is_app(id) && w.shows(title)) {
+        return false;
+    }
+    hidden.iter().any(|w| w.is_app(id) && w.shows(title)) || (hidden.iter().any(|w| w.is_app(id)) && !shown.iter().any(|w| w.is_app(id)))
+}
+
+/// Pauses the media playing in the windows being put away (live streams excluded, see `has_length`).
+/// Returns what it paused, to play it again later.
+pub fn pause_media(hidden: &[MediaWindow], shown: &[MediaWindow]) -> Vec<PausedMedia> {
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status;
+    let mut paused = Vec::new();
+    if hidden.is_empty() {
+        return paused;
+    }
+    for (id, session) in media_sessions() {
+        let playing = session.GetPlaybackInfo().and_then(|i| i.PlaybackStatus()).is_ok_and(|s| s == Status::Playing);
+        if !playing || !hidden.iter().any(|w| w.is_app(&id)) || !has_length(&session) {
+            continue;
+        }
+        let title = media_title(&session);
+        if belongs_to_hidden(&id, &title, hidden, shown) && session.TryPauseAsync().and_then(|op| op.join()).unwrap_or(false) {
+            paused.push((id, title));
+        }
+    }
+    paused
+}
+
+/// Plays again what `pause_media` paused, if it is still paused and still the same media.
+pub fn resume_media(items: &[PausedMedia]) {
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status;
+    if items.is_empty() {
+        return;
+    }
+    for (id, session) in media_sessions() {
+        let paused = session.GetPlaybackInfo().and_then(|i| i.PlaybackStatus()).is_ok_and(|s| s == Status::Paused);
+        if !paused || !items.iter().any(|(i, _)| *i == id) {
+            continue;
+        }
+        let title = media_title(&session);
+        if items.iter().any(|(i, t)| *i == id && (t.is_empty() || *t == title)) {
+            let _ = session.TryPlayAsync().and_then(|op| op.join());
+        }
+    }
+}
+
+/// Whether a paused item should play again now that `shown` are up and `hidden` are put away.
+pub fn media_comes_back(item: &PausedMedia, shown: &[MediaWindow], hidden: &[MediaWindow]) -> bool {
+    let (id, title) = item;
+    if shown.iter().any(|w| w.is_app(id) && w.shows(title)) {
+        return true;
+    }
+    // A browser has one app for all its windows: only the window showing the media brings it back,
+    // or a video in a window that is still minimized would start playing.
+    if is_browser(id) {
+        return false;
+    }
+    shown.iter().any(|w| w.is_app(id)) && (title.is_empty() || !hidden.iter().any(|w| w.is_app(id)))
+}
+
+fn is_browser(id: &str) -> bool {
+    let stem = id.trim_end_matches(".exe");
+    ["chrome", "msedge", "firefox", "whale", "brave", "opera", "vivaldi"].iter().any(|b| stem == *b || stem.starts_with(&format!("{b}.")))
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+
+    fn w(ids: &[&str], title: &str) -> MediaWindow {
+        MediaWindow { ids: ids.iter().map(|s| s.to_string()).collect(), title: title.into() }
+    }
+
+    #[test]
+    fn browser_media_follows_the_window_title() {
+        let video = w(&["chrome"], "재밌는 영상 - YouTube - Google Chrome");
+        let docs = w(&["chrome"], "GitHub - Google Chrome");
+        // The YouTube window goes away while another Chrome window comes up: pause it.
+        assert!(belongs_to_hidden("chrome", "재밌는 영상", &[video], std::slice::from_ref(&docs)));
+        // The YouTube window comes up: leave it playing.
+        let video = w(&["chrome"], "재밌는 영상 - YouTube - Google Chrome");
+        assert!(!belongs_to_hidden("chrome", "재밌는 영상", &[docs], &[video]));
+        // Spotify's window title does not name the song; the app alone decides.
+        assert!(belongs_to_hidden("spotify.exe", "노래", &[w(&["spotify"], "Spotify Premium")], &[w(&["code"], "x")]));
+    }
+
+    #[test]
+    fn browser_media_comes_back_only_with_its_window() {
+        let gmail = w(&["chrome"], "받은편지함 - Gmail - Google Chrome");
+        let video = w(&["chrome"], "재밌는 영상 - YouTube - Google Chrome");
+        let item = ("chrome".to_string(), "재밌는 영상".to_string());
+        // Another Chrome window comes up while the video's window stays minimized: keep it paused.
+        assert!(!media_comes_back(&item, std::slice::from_ref(&gmail), &[]));
+        assert!(media_comes_back(&item, &[video], &[gmail]));
+        // Other apps: the app coming back is enough.
+        assert!(media_comes_back(&("spotify.exe".into(), "노래".into()), &[w(&["spotify"], "Spotify")], &[]));
+    }
+}
+
 // ---------- windows ----------
 
 /// A window we may act on: (hwnd, owning process id). The pid check stops us acting on a
 /// different window that later reuses the same handle.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub struct WinRef {
     pub hwnd: isize,
     pub pid: u32,
@@ -345,11 +584,19 @@ fn is_app_window(h: HWND) -> bool {
         if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() {
             return false;
         }
-        if GetWindow(h, GW_OWNER).is_ok_and(|o| !o.is_invalid()) {
+        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        // Owned windows are dialogs, unless the owner is a hidden helper window (some apps' main
+        // windows work that way) or the window asks for a taskbar button. Same rule as Alt+Tab.
+        if let Ok(owner) = GetWindow(h, GW_OWNER) {
+            if !owner.is_invalid() && IsWindowVisible(owner).as_bool() && ex & WS_EX_APPWINDOW.0 == 0 {
+                return false;
+            }
+        }
+        if ex & WS_EX_TOOLWINDOW.0 != 0 {
             return false;
         }
-        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
-        if ex & WS_EX_TOOLWINDOW.0 != 0 {
+        // Click-through overlays (game and GPU overlays, some pop-ups), as Alt+Tab leaves them out.
+        if ex & WS_EX_NOACTIVATE.0 != 0 && ex & WS_EX_APPWINDOW.0 == 0 {
             return false;
         }
         if GetWindowTextLengthW(h) == 0 {
@@ -366,10 +613,9 @@ fn is_app_window(h: HWND) -> bool {
     }
 }
 
-/// Minimizes every app window except Keyscene's own. Returns them top-most first.
-pub fn show_desktop() -> Vec<WinRef> {
+/// App windows that are up (not minimized), except Keyscene's own, top-most first.
+pub fn visible_app_windows() -> Vec<WinRef> {
     let own_pid = std::process::id();
-    let mut found: Vec<WinRef> = Vec::new();
     unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> windows::core::BOOL {
         let list = &mut *(lp.0 as *mut Vec<isize>);
         if is_app_window(h) {
@@ -381,27 +627,199 @@ pub fn show_desktop() -> Vec<WinRef> {
     unsafe {
         let _ = EnumWindows(Some(collect), LPARAM(&mut handles as *mut Vec<isize> as isize));
     }
-    for h in handles {
-        if let Some(w) = win_ref(h).filter(|w| w.pid != own_pid) {
-            // Async: a hung app must not stall the preset.
-            unsafe {
-                let _ = ShowWindowAsync(hwnd(h), SW_MINIMIZE);
-            }
-            found.push(w);
-        }
-    }
-    found
+    handles.into_iter().filter_map(win_ref).filter(|w| w.pid != own_pid).collect()
 }
 
-/// Brings back windows that are still minimized, bottom-most first so the old top window ends on top.
-pub fn restore_minimized(list: &[WinRef]) {
-    for w in list.iter().rev() {
-        if still_valid(w) && unsafe { IsIconic(hwnd(w.hwnd)).as_bool() } {
-            unsafe {
-                let _ = ShowWindowAsync(hwnd(w.hwnd), SW_RESTORE);
+/// What 바탕 화면 보기 did.
+pub struct Desktop {
+    /// The windows it minimized, top-most first.
+    pub minimized: Vec<WinRef>,
+    /// Every app window that was up, top-most first, to put back in this order.
+    pub stack: Vec<WinRef>,
+    /// Processes whose windows it could not touch because they run as administrator.
+    pub elevated: Vec<u32>,
+}
+
+/// Minimizes every app window except Keyscene's own and those in `keep` (windows a later step
+/// brings forward anyway, so they don't go down and come straight back up). Frozen windows are left
+/// alone: a minimize queued for them would land long after the preset is undone.
+pub fn show_desktop(keep: &std::collections::HashSet<isize>) -> Desktop {
+    let mut out = Desktop { minimized: Vec::new(), stack: Vec::new(), elevated: Vec::new() };
+    for w in visible_app_windows() {
+        if elevated_above_us(w.pid) {
+            if !out.elevated.contains(&w.pid) {
+                out.elevated.push(w.pid);
             }
+            continue;
+        }
+        if !answers(w.hwnd) {
+            continue;
+        }
+        out.stack.push(w);
+        // Async: a slow app must not stall the preset.
+        if !keep.contains(&w.hwnd) && unsafe { ShowWindowAsync(hwnd(w.hwnd), SW_MINIMIZE).as_bool() } {
+            out.minimized.push(w);
         }
     }
+    out
+}
+
+/// Waits (up to about a second) until the windows 바탕 화면 보기 minimized really are minimized, and
+/// asks once more, the way the title bar's button does, those that ignored the first request.
+/// Skips windows a later step of the same preset brought up (`claimed`) and the active window.
+/// Called at the end of the preset, so the other steps don't wait for it and a quick second press
+/// can't start undoing while windows are still going down.
+pub fn settle_minimized(list: &[WinRef], claimed: &std::collections::HashSet<isize>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+    let retry_at = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    let mut retried = false;
+    loop {
+        let fg = unsafe { GetForegroundWindow() }.0 as isize;
+        let pending: Vec<&WinRef> = list
+            .iter()
+            .filter(|w| !claimed.contains(&w.hwnd) && w.hwnd != fg && still_valid(w))
+            .filter(|w| unsafe { IsWindowVisible(hwnd(w.hwnd)).as_bool() && !IsIconic(hwnd(w.hwnd)).as_bool() })
+            .collect();
+        let now = std::time::Instant::now();
+        if pending.is_empty() || now >= deadline {
+            return;
+        }
+        if !retried && now >= retry_at {
+            retried = true;
+            for w in pending {
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd(w.hwnd)), WM_SYSCOMMAND, WPARAM(SC_MINIMIZE as usize), LPARAM(0));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+}
+
+/// False when Windows considers the window's app frozen ("응답 없음"): calls that wait for it, such as
+/// moving or reordering its window, could block. Instant to ask, unlike pinging the window.
+pub fn answers(h: isize) -> bool {
+    unsafe { IsWindow(Some(hwnd(h))).as_bool() && !IsHungAppWindow(hwnd(h)).as_bool() }
+}
+
+/// Brings back windows that are still minimized, skipping `skip` and frozen windows.
+/// Async, so the order they come up in is not reliable; `restack` fixes that afterwards.
+/// Returns the windows it asked to come back.
+pub fn restore_minimized(list: &[WinRef], skip: &std::collections::HashSet<isize>) -> Vec<WinRef> {
+    let mut restored = Vec::new();
+    for w in list.iter().rev() {
+        if skip.contains(&w.hwnd) || !still_valid(w) || unsafe { !IsIconic(hwnd(w.hwnd)).as_bool() } || !answers(w.hwnd) {
+            continue;
+        }
+        unsafe {
+            let _ = ShowWindowAsync(hwnd(w.hwnd), SW_RESTORE);
+        }
+        restored.push(*w);
+    }
+    restored.reverse();
+    restored
+}
+
+/// The window at the top of `h`'s owner chain (itself when it has no owner).
+pub fn root_owner(h: isize) -> isize {
+    let r = unsafe { GetAncestor(hwnd(h), GA_ROOTOWNER) };
+    if r.is_invalid() { h } else { r.0 as isize }
+}
+
+pub fn win_is_up(w: &WinRef) -> bool {
+    is_up(w)
+}
+
+fn is_up(w: &WinRef) -> bool {
+    still_valid(w) && unsafe { IsWindowVisible(hwnd(w.hwnd)).as_bool() && !IsIconic(hwnd(w.hwnd)).as_bool() }
+}
+
+fn is_cloaked(h: isize) -> bool {
+    let mut cloaked = 0u32;
+    unsafe { DwmGetWindowAttribute(hwnd(h), DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4).is_ok() && cloaked != 0 }
+}
+
+pub fn is_topmost_window(h: isize) -> bool {
+    unsafe { (GetWindowLongW(hwnd(h), GWL_EXSTYLE) as u32) & WS_EX_TOPMOST.0 != 0 }
+}
+
+/// Puts `moved` (windows the undo brought back or put back) in their old stacking order, given by
+/// `order` (top-most first; may hold other windows too). Each app handles its restore in its own
+/// time, so without this a slow app (often a browser) could end up on top of windows that were above
+/// it. Waits up to 3 s for windows still coming up; any still not up then are fitted in later from a
+/// background thread. Frozen, closed and still-minimized windows are left alone.
+pub fn restack(order: &[WinRef], moved: &[WinRef]) {
+    let moved: std::collections::HashSet<WinRef> = moved.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    let list: Vec<WinRef> = order.iter().copied().filter(|w| moved.contains(w) && seen.insert(*w)).collect();
+    if list.is_empty() {
+        return;
+    }
+    let coming_up = |w: &WinRef| still_valid(w) && unsafe { IsIconic(hwnd(w.hwnd)).as_bool() };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while list.iter().any(coming_up) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Bottom-most first, each to the top of its band (an always-on-top window stays always on top).
+    for w in list.iter().rev().filter(|w| is_up(w) && answers(w.hwnd)) {
+        unsafe {
+            let _ = SetWindowPos(hwnd(w.hwnd), Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+    let late: Vec<WinRef> = list.iter().copied().filter(coming_up).collect();
+    if late.is_empty() {
+        return;
+    }
+    // Very slow windows: slot each one in under the window that was above it, once it is up.
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut waiting = late;
+        while !waiting.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            waiting.retain(|w| {
+                if !still_valid(w) {
+                    return false;
+                }
+                if !is_up(w) {
+                    return true;
+                }
+                let at = list.iter().position(|x| x == w).unwrap_or(0);
+                // Never under an always-on-top window: that would make this one always on top too.
+                if let Some(above) = list[..at].iter().rev().find(|x| is_up(x) && !is_topmost_window(x.hwnd)) {
+                    unsafe {
+                        let _ = SetWindowPos(hwnd(w.hwnd), Some(hwnd(above.hwnd)), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                    }
+                }
+                false
+            });
+        }
+    });
+}
+
+/// The window to make active after an undo: the one that was active when the preset ran, if it is up
+/// again, otherwise the top-most window brought back that isn't always on top. None for windows on
+/// another virtual desktop (activating one would switch desktops).
+pub fn pick_focus(front: Option<WinRef>, order: &[WinRef], moved: &[WinRef]) -> Option<WinRef> {
+    let ok = |w: &WinRef| is_up(w) && !is_cloaked(w.hwnd);
+    if let Some(f) = front.filter(|f| moved.contains(f) && ok(f)) {
+        return Some(f);
+    }
+    order.iter().chain(moved).find(|w| moved.contains(w) && ok(w) && !is_topmost_window(w.hwnd)).copied()
+}
+
+/// True when the user is not busy in another window: the desktop, the taskbar, Keyscene or one of `ours` is in front.
+pub fn foreground_is_free(ours: &[WinRef]) -> bool {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_invalid() {
+        return true;
+    }
+    let h = fg.0 as isize;
+    if ours.iter().any(|w| w.hwnd == h) {
+        return true;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    pid == std::process::id() || matches!(class_name(fg).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
 }
 
 pub fn minimize(w: &WinRef) -> bool {
@@ -470,6 +888,29 @@ mod tests {
         assert_eq!(code_to_vk("Super"), Some(VK_LWIN));
         assert_eq!(code_to_vk("F25"), None);
         assert_eq!(code_to_vk("Nope"), None);
+        // The number pad and other keys the recorder in the window can hand over.
+        assert_eq!(code_to_vk("Numpad0"), Some(VK_NUMPAD0));
+        assert_eq!(code_to_vk("Numpad9"), Some(VK_NUMPAD9));
+        assert_eq!(code_to_vk("NumpadAdd"), Some(VK_ADD));
+        assert_eq!(code_to_vk("NumpadX"), None);
+        assert_eq!(code_to_vk("Lang1"), Some(VK_HANGUL));
+        assert_eq!(code_to_vk("AudioVolumeUp"), Some(VK_VOLUME_UP));
+    }
+
+    #[test]
+    fn line_breaks_and_tabs_are_typed_as_keys() {
+        let keys = |text: &str| -> Vec<(u16, u16, bool)> {
+            text_inputs(text)
+                .iter()
+                .map(|i| unsafe { (i.Anonymous.ki.wVk.0, i.Anonymous.ki.wScan, i.Anonymous.ki.dwFlags.contains(KEYEVENTF_KEYUP)) })
+                .collect()
+        };
+        let (enter, tab) = (VK_RETURN.0, VK_TAB.0);
+        assert_eq!(keys("a\n"), [(0, 'a' as u16, false), (0, 'a' as u16, true), (enter, 0, false), (enter, 0, true)]);
+        // Windows line endings are one Enter, not two.
+        assert_eq!(keys("\r\n\t"), [(enter, 0, false), (enter, 0, true), (tab, 0, false), (tab, 0, true)]);
+        // Characters outside the basic plane take two UTF-16 units, each pressed and released.
+        assert_eq!(keys("가😀").len(), 2 + 4);
     }
 }
 

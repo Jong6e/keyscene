@@ -180,8 +180,13 @@ fn hotkey_label(spec: &str) -> String {
                 "Comma" => ",".into(),
                 "Period" => ".".into(),
                 "Slash" => "/".into(),
+                "ArrowLeft" => "←".into(),
+                "ArrowRight" => "→".into(),
+                "ArrowUp" => "↑".into(),
+                "ArrowDown" => "↓".into(),
                 _ if p.starts_with("Key") && p.len() == 4 => p[3..].to_string(),
                 _ if p.starts_with("Digit") && p.len() == 6 => p[5..].to_string(),
+                _ if p.starts_with("Numpad") && p.len() == 7 && p.as_bytes()[6].is_ascii_digit() => format!("Num {}", &p[6..]),
                 _ => p.to_string(),
             }
         })
@@ -533,7 +538,7 @@ fn toggle_preset(app: &AppHandle, id: &str, front: Option<system::WinRef>, by: P
         let pending = st.running.lock().unwrap().remove(&id);
         let pending = pending.filter(|undo| undo.iter().any(engine::Undo::still_applies));
         let errors = match (pending, by) {
-            (Some(undo), _) => engine::restore(undo),
+            (Some(undo), by) => engine::restore(undo, by == Press::User),
             (None, Press::Timer) => Vec::new(),
             (None, Press::User) => {
                 let result = engine::run(&preset.steps, front);
@@ -541,7 +546,9 @@ fn toggle_preset(app: &AppHandle, id: &str, front: Option<system::WinRef>, by: P
                     set_tree_undo(&app, hide, items);
                 }
                 // Nothing to undo (e.g. only "open a web page") -> the next press simply runs again.
-                if !result.undo.is_empty() {
+                // Same when it cycles window sets: the next press shows the next set, it doesn't
+                // first undo the other steps (that took an extra press per switch).
+                if !result.undo.is_empty() && !preset.cycles() {
                     st.running.lock().unwrap().insert(id.clone(), result.undo);
                     if let Some(minutes) = preset.revert_after_min {
                         start_revert(&app, &id, minutes);
@@ -583,29 +590,47 @@ fn new_preset_id() -> String {
 
 /// Runs when another window comes to the front. Releases or takes back the shortcuts.
 fn on_foreground(app: &AppHandle, hwnd: isize) {
-    let st = state(app);
-    if st.capturing.load(Ordering::SeqCst) {
+    // While a new combination is recorded nothing is registered anyway; the window in front is
+    // looked at again when the recording ends.
+    if state(app).capturing.load(Ordering::SeqCst) {
         return;
     }
+    if update_suspended(app, hwnd) {
+        apply_hotkeys(app);
+        sync(app);
+    }
+}
+
+/// Works out whether `hwnd`, the window in front, belongs to an excluded app and remembers it.
+/// Returns true when that changed (the caller then registers or releases the shortcuts).
+fn update_suspended(app: &AppHandle, hwnd: isize) -> bool {
+    let st = state(app);
     // Nothing excluded and nothing paused: skip looking up the program behind every switch.
     if st.config.lock().unwrap().excluded_apps.is_empty() && st.suspended_by.lock().unwrap().is_none() {
-        return;
+        return false;
     }
     let exe = launch::window_exe(hwnd);
     // Keyscene's own settings window is not a reason to change anything.
     if exe.as_deref() == std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).as_deref() {
-        return;
+        return false;
     }
     let hit = {
         let cfg = st.config.lock().unwrap();
         exe.and_then(|e| cfg.excluded_apps.iter().find(|a| a.exe == e).map(|a| a.name.clone()))
     };
-    let changed = { *st.suspended_by.lock().unwrap() != hit };
-    if changed {
-        *st.suspended_by.lock().unwrap() = hit;
-        apply_hotkeys(app);
-        sync(app);
+    let mut suspended = st.suspended_by.lock().unwrap();
+    if *suspended == hit {
+        return false;
     }
+    *suspended = hit;
+    true
+}
+
+/// Looks at the window in front right now. Used when shortcut recording ends: window switches made
+/// meanwhile were not followed, and an excluded app may have come to the front since.
+fn recheck_foreground(app: &AppHandle) {
+    let front = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
+    update_suspended(app, front);
 }
 
 fn exe_file_name(input: &str) -> Option<String> {
@@ -615,7 +640,31 @@ fn exe_file_name(input: &str) -> Option<String> {
 
 // ---------- shortcuts ----------
 
+/// Registers the shortcuts that should work right now (none while paused or while an excluded app
+/// is in front) and records which could not be registered.
+///
+/// Always runs on the main thread, like `sync`. Each register call is handed to the main thread
+/// anyway, so a run started on another thread could be cut in two by one started on the main
+/// thread: the second then finds its keys "taken" and one of the two lists ends up wrong.
 fn apply_hotkeys(app: &AppHandle) {
+    if MAIN_THREAD.get() == Some(&std::thread::current().id()) {
+        apply_hotkeys_now(app);
+    } else {
+        // Waited for, so the caller can read the result (which keys failed) right after.
+        // Callers hold no lock here; the main thread never waits for them.
+        let (done, wait) = std::sync::mpsc::channel();
+        let h = app.clone();
+        let sent = app.run_on_main_thread(move || {
+            apply_hotkeys_now(&h);
+            let _ = done.send(());
+        });
+        if sent.is_ok() {
+            let _ = wait.recv(); // an error means the app is closing and the work was dropped
+        }
+    }
+}
+
+fn apply_hotkeys_now(app: &AppHandle) {
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
     let st = state(app);
@@ -813,6 +862,7 @@ fn begin_hotkey_capture(app: AppHandle) {
 #[tauri::command]
 fn end_hotkey_capture(app: AppHandle) -> StateDto {
     state(&app).capturing.store(false, Ordering::SeqCst);
+    recheck_foreground(&app);
     apply_hotkeys(&app);
     sync(&app);
     snapshot(&app)
@@ -868,6 +918,12 @@ async fn list_running_apps() -> Vec<launch::RunningApp> {
     tauri::async_runtime::spawn_blocking(launch::running_apps).await.unwrap_or_default()
 }
 
+/// The apps with a window open now, for recording a "창 세트".
+#[tauri::command]
+async fn list_open_window_apps() -> Vec<launch::OpenWindowApp> {
+    tauri::async_runtime::spawn_blocking(launch::open_window_apps).await.unwrap_or_default()
+}
+
 /// Replaces the list. `exe` may be a full path or a file name; it is stored as a lowercase file name.
 #[tauri::command]
 fn set_excluded_apps(app: AppHandle, apps: Vec<config::ExcludedApp>) -> Result<StateDto, String> {
@@ -889,9 +945,8 @@ fn set_excluded_apps(app: AppHandle, apps: Vec<config::ExcludedApp>) -> Result<S
     state(&app).config.lock().unwrap().excluded_apps = clean;
     save_config(&app)?;
     // Re-check the window in front right now, so the change applies immediately.
-    let front = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
     *state(&app).suspended_by.lock().unwrap() = None;
-    on_foreground(&app, front);
+    recheck_foreground(&app);
     apply_hotkeys(&app);
     sync(&app);
     Ok(snapshot(&app))
@@ -1069,7 +1124,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "settings" => open_settings(app),
             "tree-undo" => undo_tree(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                engine::unmute_all_sets();
+                app.exit(0)
+            }
             id if id.starts_with("preset:") => toggle_preset(app, &id["preset:".len()..], None, Press::User),
             _ => {}
         })
@@ -1138,6 +1196,7 @@ fn main() {
                 // Closed while recording a shortcut: the page never ended the recording, so
                 // put the shortcuts back here or they would stay off.
                 if state(window.app_handle()).capturing.swap(false, Ordering::SeqCst) {
+                    recheck_foreground(window.app_handle());
                     apply_hotkeys(window.app_handle());
                     sync(window.app_handle());
                 }
@@ -1160,6 +1219,8 @@ fn main() {
             };
             let path = dir.join("config.json");
             let journal_path = dir.join("restore.json");
+            // Programs a window set muted when Keyscene last quit or crashed get their sound back.
+            engine::init_muted(dir.join("muted.json"));
             let first_run = !path.exists();
             let (cfg, mut warning) = config::load(&path);
             if let Some(w) = &warning {
@@ -1235,6 +1296,7 @@ fn main() {
             pick_file,
             pick_path,
             list_running_apps,
+            list_open_window_apps,
             set_excluded_apps,
             open_release_page
         ])
@@ -1247,4 +1309,30 @@ fn main() {
             api.prevent_exit();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortcut_labels() {
+        assert_eq!(hotkey_label("Control+Alt+KeyH"), "Ctrl+Alt+H");
+        assert_eq!(hotkey_label("Alt+Backquote"), "Alt+`");
+        assert_eq!(hotkey_label("Super+Control+ArrowRight"), "Win+Ctrl+→");
+        assert_eq!(hotkey_label("Control+Numpad7"), "Ctrl+Num 7");
+        assert_eq!(hotkey_label("Shift+NumpadAdd"), "Shift+NumpadAdd");
+        assert_eq!(hotkey_label("Control+Digit0"), "Ctrl+0");
+        assert_eq!(hotkey_label("F12"), "F12");
+    }
+
+    #[test]
+    fn run_argument() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(run_arg(&args(&["keyscene.exe", "--run", "화면 공유 모드"])).map(String::as_str), Some("화면 공유 모드"));
+        assert_eq!(run_arg(&args(&["keyscene.exe", "--run"])), None);
+        assert_eq!(run_arg(&args(&["keyscene.exe"])), None);
+        assert_eq!(exe_file_name(r#""C:\Games\Game.EXE""#).as_deref(), Some("game.exe"));
+        assert_eq!(exe_file_name("notes.txt"), None);
+    }
 }

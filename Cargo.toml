@@ -1,6 +1,6 @@
 [package]
 name = "keyscene"
-version = "0.3.1"
+version = "1.0.0"
 edition = "2021"
 description = "Keyscene - 단축키 하나로 Windows 동작 여러 개를 실행하고 되돌리는 트레이 도구"
 license = "MIT"
@@ -30,6 +30,7 @@ windows = { version = "0.62", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Power",
+    "Win32_System_ProcessStatus",
     "Win32_System_Shutdown",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
@@ -49,6 +50,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Web_InternetExplorer",
     "Win32_UI_HiDpi",
+    "Media_Control",
 ] }
 windows-core = "0.62"
 windows-sys = { version = "0.61", features = [

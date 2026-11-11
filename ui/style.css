@@ -319,6 +319,20 @@ button.step-body:hover { background: var(--item-hover); }
 .range-value { width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
 .button-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .input-row { display: flex; gap: 8px; }
+.sets { display: flex; flex-direction: column; gap: 8px; }
+.sets:empty { display: none; }
+.set.card { padding: 8px 8px 4px 12px; }
+.set.card + .set.card { margin-top: 0; }
+.set-head { display: flex; align-items: center; gap: 8px; }
+.set-head input { flex: 1; min-width: 0; }
+.set-apps { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; }
+.set-app { min-height: 36px; display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--divider); }
+.set-empty { margin: 6px 0 8px; }
+.set-app-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.set-app-text .app-name, .set-app-text .sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.set-app-text .app-name { font-size: 14px; }
+.set-url { margin: 6px 0 6px; }
+.set-url input { flex: 1; min-width: 0; }
 .checks { display: flex; flex-direction: column; gap: 2px; }
 .checks label { min-height: 40px; display: flex; align-items: center; gap: 10px; font-size: 14px; }
 .keys-row { display: flex; }
